@@ -36,6 +36,14 @@ async def init_db() -> None:
                 series_type TEXT NOT NULL,
                 cached_at   TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS user_dm_subscriptions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                manga_url   TEXT NOT NULL,
+                manga_title TEXT NOT NULL,
+                UNIQUE(user_id, manga_url)
+            );
             """
         )
         await db.commit()
@@ -140,3 +148,74 @@ async def cache_series_type(manga_url: str, series_type: str) -> None:
             (manga_url, series_type),
         )
         await db.commit()
+
+
+async def add_dm_subscription(user_id: int, manga_url: str, manga_title: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO user_dm_subscriptions (user_id, manga_url, manga_title) VALUES (?,?,?)",
+                (user_id, manga_url, manga_title),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def remove_dm_subscription(user_id: int, manga_url: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM user_dm_subscriptions WHERE user_id=? AND manga_url=?",
+            (user_id, manga_url),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_dm_subscriptions(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT manga_url, manga_title FROM user_dm_subscriptions WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [{"url": r[0], "title": r[1]} for r in rows]
+
+
+async def get_users_subscribed_to_dm(manga_url: str) -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM user_dm_subscriptions WHERE manga_url=?", (manga_url,)
+        ) as cur:
+            rows = await cur.fetchall()
+            return [r[0] for r in rows]
+
+
+async def get_seen_chapters_for_manga(manga_title: str) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT chapter_url, chapter_num FROM seen_chapters
+               WHERE manga_title = ?
+               ORDER BY seen_at DESC""",
+            (manga_title,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [{"url": r[0], "num": r[1]} for r in rows]
+
+
+async def get_dm_user_count() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM user_dm_subscriptions"
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def get_all_dm_subscriptions() -> list[tuple[int, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT DISTINCT user_id, manga_url FROM user_dm_subscriptions"
+        ) as cur:
+            return await cur.fetchall()

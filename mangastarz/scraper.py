@@ -119,25 +119,118 @@ def fetch_series_type(title: str) -> str:
         return ""
 
 
-def search_manga(query: str) -> list[dict]:
-    """Search manga-starz.net by title."""
-    scraper = _make_scraper()
-    url = f"{BASE_URL}/?s={query.replace(' ', '+')}&post_type=wp-manga"
+def _get_manga_post_id(title: str, scraper: cloudscraper.CloudScraper) -> str | None:
+    """Find WordPress post ID for a manga by searching via madara_load_more AJAX."""
+    ajax_url = f"{BASE_URL}/wp-admin/admin-ajax.php"
+    data = {
+        "action": "madara_load_more",
+        "page": "0",
+        "template": "madara-core/content/content-archive",
+        "vars[paged]": "1",
+        "vars[orderby]": "meta_value_num",
+        "vars[template]": "archive",
+        "vars[sidebar]": "right",
+        "vars[post_type]": "wp-manga",
+        "vars[post_status]": "publish",
+        "vars[s]": title,
+        "vars[manga_archives_item_layout]": "default",
+    }
     try:
-        resp = scraper.get(url, timeout=30)
+        resp = scraper.post(
+            ajax_url, data=data,
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": BASE_URL},
+            timeout=30,
+        )
         resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        item = soup.select_one("[data-post-id]")
+        if item:
+            post_id = item.get("data-post-id")
+            log.info("[starz] Found post ID %s for '%s'", post_id, title)
+            return post_id
     except Exception as e:
-        log.error("[starz] Search failed: %s", e)
+        log.warning("[starz] madara_load_more failed for '%s': %s", title, e)
+    return None
+
+
+def fetch_manga_chapters(manga_title: str) -> list[dict]:
+    """Fetch all chapters for a manga using Madara AJAX (bypasses Cloudflare page blocks).
+
+    Strategy:
+      1. Use madara_load_more AJAX with a title search to get the WordPress post ID.
+      2. POST to manga_get_chapters AJAX with that post ID to get the chapter list.
+    """
+    scraper = _make_scraper()
+
+    post_id = _get_manga_post_id(manga_title, scraper)
+    if not post_id:
+        log.error("[starz] Could not find post ID for '%s'", manga_title)
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    ajax_url = f"{BASE_URL}/wp-admin/admin-ajax.php"
+    try:
+        resp = scraper.post(
+            ajax_url,
+            data={"action": "manga_get_chapters", "manga": post_id},
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": BASE_URL},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        chapters: list[dict] = []
+        for li in soup.select("li.wp-manga-chapter"):
+            a = li.select_one("a")
+            if not a:
+                continue
+            ch_url = a.get("href", "").strip()
+            ch_num = a.get_text(strip=True)
+            if ch_url:
+                chapters.append({"num": ch_num, "url": ch_url})
+        log.info("[starz] Fetched %d chapters for '%s'", len(chapters), manga_title)
+        return chapters
+    except Exception as e:
+        log.error("[starz] manga_get_chapters failed for post %s: %s", post_id, e)
+        return []
+
+
+def search_manga(query: str) -> list[dict]:
+    """Search manga-starz.net by title using the Madara AJAX endpoint."""
+    scraper = _make_scraper()
+    try:
+        scraper.get(f"{BASE_URL}/", timeout=30)
+    except Exception:
+        pass
+
+    ajax_url = f"{BASE_URL}/wp-admin/admin-ajax.php"
+    try:
+        resp = scraper.post(
+            ajax_url,
+            data={"action": "wp-manga-search-manga", "title": query},
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": BASE_URL},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success") and data.get("data"):
+            results = []
+            for item in data["data"]:
+                title = item.get("title", "")
+                url = item.get("url", "")
+                if title and url:
+                    results.append({"title": title, "url": url})
+            if results:
+                log.info("[starz] AJAX search found %d results", len(results))
+                return results[:10]
+    except Exception as e:
+        log.warning("[starz] AJAX search failed: %s — falling back to local search", e)
+
+    log.info("[starz] Falling back to local chapter list search for '%s'", query)
+    chapters = fetch_latest_chapters()
+    q = query.lower()
+    seen: set[str] = set()
     results = []
-    for card in soup.select(".c-tabs-item__content, .page-item-detail"):
-        title_el = card.select_one(".post-title a, h3 a, h4 a")
-        if not title_el:
-            continue
-        results.append({
-            "title": title_el.get_text(strip=True),
-            "url":   title_el.get("href", ""),
-        })
+    for ch in chapters:
+        if q in ch.manga_title.lower() and ch.manga_url not in seen:
+            seen.add(ch.manga_url)
+            results.append({"title": ch.manga_title, "url": ch.manga_url})
     return results[:10]

@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from . import database as db
-from .scraper import Chapter, fetch_latest_chapters, fetch_series_type, search_manga
+from .scraper import Chapter, fetch_latest_chapters, fetch_manga_chapters, fetch_series_type, search_manga
 
 log = logging.getLogger(__name__)
 
@@ -68,11 +68,23 @@ class MangaBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id)
+        await self._update_presence()
+
+    async def _update_presence(self) -> None:
+        guild_channels = await db.get_all_guild_channels()
+        guild_name = ""
+        for guild_id, _ in guild_channels:
+            guild = self.get_guild(guild_id)
+            if guild:
+                guild_name = guild.name
+                break
+        label = guild_name if guild_name else "manga-starz.net"
         await self.change_presence(
+            status=discord.Status.idle,
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="مانجا ستارز للفصول الجديدة",
-            )
+                name=label,
+            ),
         )
 
     @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
@@ -104,9 +116,6 @@ class MangaBot(discord.Client):
             return
 
         guild_channels = await db.get_all_guild_channels()
-        if not guild_channels:
-            log.info("No guild channels configured.")
-            return
 
         new_count = 0
         for ch in chapters:
@@ -137,6 +146,17 @@ class MangaBot(discord.Client):
                     except Exception as e:
                         log.error("Send failed: %s", e)
 
+            dm_user_ids = await db.get_users_subscribed_to_dm(ch.manga_url)
+            for user_id in dm_user_ids:
+                try:
+                    user = await self.fetch_user(user_id)
+                    await user.send(embed=embed)
+                    log.info("DM sent to user %d for '%s'", user_id, ch.manga_title)
+                except discord.Forbidden:
+                    log.warning("Cannot DM user %d (DMs closed)", user_id)
+                except Exception as e:
+                    log.error("DM failed for user %d: %s", user_id, e)
+
         log.info("Done. %d new chapter(s) found.", new_count)
 
 
@@ -153,6 +173,82 @@ def _build_chapter_embed(ch: Chapter, series_type: str = "") -> discord.Embed:
         embed.set_thumbnail(url=ch.cover_url)
     embed.add_field(name="اقرأ الآن", value=f"[اضغط هنا]({ch.chapter_url})", inline=False)
     return embed
+
+
+# ── UI Views ──────────────────────────────────────────────────────────────────
+
+CHAPTERS_PER_PAGE = 10
+
+
+class ChapterPaginatorView(discord.ui.View):
+    def __init__(self, title: str, manga_url: str, chapters: list[dict]) -> None:
+        super().__init__(timeout=120)
+        self.title = title
+        self.manga_url = manga_url
+        self.chapters = chapters
+        self.page = 0
+        self.total_pages = max(1, (len(chapters) + CHAPTERS_PER_PAGE - 1) // CHAPTERS_PER_PAGE)
+        self._refresh_buttons()
+
+    def _refresh_buttons(self) -> None:
+        self.prev_btn.disabled = self.page == 0
+        self.next_btn.disabled = self.page >= self.total_pages - 1
+
+    def build_embed(self) -> discord.Embed:
+        start = self.page * CHAPTERS_PER_PAGE
+        end = start + CHAPTERS_PER_PAGE
+        slice_ = self.chapters[start:end]
+        lines = [f"[{ch['num']}]({ch['url']})" for ch in slice_]
+        embed = discord.Embed(
+            title=f"📚 {self.title}",
+            url=self.manga_url,
+            description="\n".join(lines) if lines else "لا توجد فصول.",
+            color=EMBED_COLOR,
+        )
+        embed.set_footer(text=f"صفحة {self.page + 1} / {self.total_pages}  •  {SITE_NAME}")
+        return embed
+
+    @discord.ui.button(label="◀ السابق", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page -= 1
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="التالي ▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page += 1
+        self._refresh_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+class SearchConfirmView(discord.ui.View):
+    def __init__(self, result: dict) -> None:
+        super().__init__(timeout=60)
+        self.result = result
+
+    @discord.ui.button(label="✅ نعم", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content="⏳ جاري جلب الفصول…", embed=None, view=None
+        )
+        loop = asyncio.get_running_loop()
+        chapters = await loop.run_in_executor(
+            None, fetch_manga_chapters, self.result["title"]
+        )
+        if not chapters:
+            await interaction.edit_original_response(
+                content=(
+                    f"❌ لم يتم العثور على فصول لـ **{self.result['title']}**.\n"
+                    f"جرب مجدداً بعد لحظات أو استخدم `/watch` لمتابعة الفصول الجديدة."
+                )
+            )
+            return
+        view = ChapterPaginatorView(self.result["title"], self.result["url"], chapters)
+        await interaction.edit_original_response(content=None, embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="❌ لا", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -245,11 +341,8 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
 
     # ── عام (الكل يستخدمها) ──────────────────────────────────────────────────
 
-    @tree.command(name="watch", description="متابعة مانهوا/مانغا معينة — سيرفر فقط")
-    async def watch(interaction: discord.Interaction, الاسم: str) -> None:
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
-            return
+    @tree.command(name="search", description="ابحث عن مانغا/مانهوا/مانها وشوف فصولها")
+    async def search(interaction: discord.Interaction, الاسم: str) -> None:
         await interaction.response.defer(ephemeral=True)
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(None, search_manga, الاسم)
@@ -258,49 +351,63 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 f"❌ لم أجد **{الاسم}** في مانجا ستارز.", ephemeral=True
             )
             return
-        best  = results[0]
-        added = await db.add_subscription(interaction.guild_id, best["url"], best["title"])
-        if added:
-            await interaction.followup.send(f"✅ تمت إضافة **{best['title']}** للمتابعة.", ephemeral=True)
-        else:
-            await interaction.followup.send(f"⚠️ **{best['title']}** مضافة مسبقاً.", ephemeral=True)
+        best = results[0]
+        embed = discord.Embed(
+            title="🔍 هل تقصد هذا؟",
+            description=f"**[{best['title']}]({best['url']})**",
+            color=EMBED_COLOR,
+        )
+        embed.set_footer(text=SITE_NAME)
+        view = SearchConfirmView(best)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-    @tree.command(name="unwatch", description="إيقاف متابعة مانهوا/مانغا معينة — سيرفر فقط")
-    async def unwatch(interaction: discord.Interaction, الاسم: str) -> None:
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+    @tree.command(name="watch", description="تلقي إشعارات بالخاص عند صدور فصل جديد")
+    async def watch(interaction: discord.Interaction, الاسم: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, search_manga, الاسم)
+        if not results:
+            await interaction.followup.send(
+                f"❌ لم أجد **{الاسم}** في مانجا ستارز.", ephemeral=True
+            )
             return
-        subs  = await db.get_subscriptions(interaction.guild_id)
+        best = results[0]
+        added = await db.add_dm_subscription(interaction.user.id, best["url"], best["title"])
+        if added:
+            await interaction.followup.send(
+                f"✅ سيصلك إشعار بالخاص عند صدور فصل جديد من **{best['title']}**.", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"⚠️ أنت مشترك بالفعل في **{best['title']}**.", ephemeral=True
+            )
+
+    @tree.command(name="unwatch", description="إيقاف إشعارات الخاص لمانغا/مانهوا معينة")
+    async def unwatch(interaction: discord.Interaction, الاسم: str) -> None:
+        subs = await db.get_dm_subscriptions(interaction.user.id)
         query = الاسم.lower()
         match = next((s for s in subs if query in s["title"].lower()), None)
         if not match:
             await interaction.response.send_message(
-                f"❌ لم أجد **{الاسم}** في قائمة متابعتك.", ephemeral=True
+                f"❌ لم أجد **{الاسم}** في قائمة اشتراكاتك.", ephemeral=True
             )
             return
-        await db.remove_subscription(interaction.guild_id, match["url"])
+        await db.remove_dm_subscription(interaction.user.id, match["url"])
         await interaction.response.send_message(
-            f"✅ تمت إزالة **{match['title']}** من المتابعة.", ephemeral=True
+            f"✅ تم إيقاف إشعارات الخاص لـ **{match['title']}**.", ephemeral=True
         )
 
-    @tree.command(name="list", description="عرض العناوين التي تتابعها — سيرفر فقط")
+    @tree.command(name="list", description="عرض العناوين التي تتلقى إشعاراتها بالخاص")
     async def list_subs(interaction: discord.Interaction) -> None:
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
-            return
-        subs = await db.get_subscriptions(interaction.guild_id)
+        subs = await db.get_dm_subscriptions(interaction.user.id)
         if not subs:
-            channel_id = await db.get_guild_channel(interaction.guild_id)
-            msg = (
-                "📋 لا توجد اشتراكات — البوت يرسل إشعارات لجميع الفصول الجديدة."
-                if channel_id
-                else "📋 لا توجد اشتراكات. استخدم `/setchannel` أولاً."
+            await interaction.response.send_message(
+                "📋 لا توجد اشتراكات. استخدم `/watch` لإضافة عنوان.", ephemeral=True
             )
-            await interaction.response.send_message(msg, ephemeral=True)
             return
         lines = [f"• [{s['title']}]({s['url']})" for s in subs]
         embed = discord.Embed(
-            title="📚 العناوين المتابعة",
+            title="📬 اشتراكاتك بالخاص",
             description="\n".join(lines),
             color=EMBED_COLOR,
         )
@@ -342,26 +449,20 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         embed.set_footer(text=SITE_NAME)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @tree.command(name="status", description="حالة البوت — خاص وسيرفر")
+    @tree.command(name="status", description="حالة البوت واشتراكاتك")
     async def status(interaction: discord.Interaction) -> None:
         embed = discord.Embed(title="📊 حالة البوت", color=EMBED_COLOR)
         embed.add_field(name="تكرار الفحص", value=f"كل {POLL_INTERVAL_MINUTES} دقائق", inline=False)
         embed.add_field(name="المصدر", value=f"[{SITE_NAME}]({SITE_URL})", inline=False)
-
-        if interaction.guild_id:
-            channel_id = await db.get_guild_channel(interaction.guild_id)
-            subs       = await db.get_subscriptions(interaction.guild_id)
-            channel_mention = f"<#{channel_id}>" if channel_id else "لم يتم التعيين"
-            mode = "جميع العناوين" if not subs else f"{len(subs)} عنوان محدد"
-            embed.add_field(name="قناة الإشعارات", value=channel_mention, inline=False)
-            embed.add_field(name="وضع الإشعارات", value=mode, inline=False)
-        else:
-            embed.add_field(
-                name="ملاحظة",
-                value="استخدم `/setchannel` في السيرفر لتفعيل الإشعارات.",
-                inline=False,
-            )
-
+        total = await db.get_dm_user_count()
+        embed.add_field(
+            name="✨ المشتركون",
+            value=f"{total} subscriber{'s' if total != 1 else ''}",
+            inline=False,
+        )
+        subs = await db.get_dm_subscriptions(interaction.user.id)
+        mode = f"{len(subs)} عنوان" if subs else "لا توجد اشتراكات — استخدم `/watch`"
+        embed.add_field(name="📬 اشتراكاتك بالخاص", value=mode, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
