@@ -334,8 +334,33 @@ def _try_direct_url(slug: str, scraper: cloudscraper.CloudScraper) -> dict | Non
     return None
 
 
+def _full_size_image(src: str) -> str:
+    """Strip WordPress thumbnail suffix (e.g. -110x150) to get the original image."""
+    return re.sub(r"-\d+x\d+(\.\w+)$", r"\1", src)
+
+
+def _covers_from_madara_soup(soup: BeautifulSoup) -> dict[str, str]:
+    """Extract {url → cover_url} from madara_load_more HTML soup."""
+    covers: dict[str, str] = {}
+    for item in soup.select("[data-post-id]"):
+        link = item.select_one("a[href]")
+        img  = item.select_one("img")
+        if not link or not img:
+            continue
+        url = link.get("href", "").strip().rstrip("/") + "/"
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-lazy-src")
+            or ""
+        )
+        if url and src:
+            covers[url] = _full_size_image(src)
+    return covers
+
+
 def search_manga(query: str) -> list[dict]:
-    """Search manga-starz.net by title. Returns [{title, url}, ...]."""
+    """Search manga-starz.net by title. Returns [{title, url, cover}, ...]."""
     scraper = _make_scraper()
     try:
         scraper.get(f"{BASE_URL}/", timeout=20)
@@ -355,13 +380,21 @@ def search_manga(query: str) -> list[dict]:
         data = resp.json()
         if data.get("success") and data.get("data"):
             results = [
-                {"title": item["title"], "url": item["url"]}
+                {"title": item["title"], "url": item["url"], "cover": ""}
                 for item in data["data"]
                 if item.get("title") and item.get("url")
             ]
             log.info("[starz-v2] search '%s' → %d results", query, len(results))
     except Exception as exc:
         log.warning("[starz-v2] search AJAX failed: %s — fallback to homepage", exc)
+
+    # Fetch covers via madara_load_more (returns HTML with thumbnails)
+    madara_soup = _madara_search(query, scraper)
+    covers = _covers_from_madara_soup(madara_soup)
+    for r in results:
+        key = r["url"].rstrip("/") + "/"
+        if not r["cover"] and key in covers:
+            r["cover"] = covers[key]
 
     # Try direct slug URL — catches exact-name titles the API misses (e.g. "one-piece")
     slug = _query_to_slug(query)
@@ -372,9 +405,13 @@ def search_manga(query: str) -> list[dict]:
     if not already_in_results:
         direct = _try_direct_url(slug, scraper)
         if direct:
+            direct["cover"] = covers.get(direct["url"].rstrip("/") + "/", "")
             results.insert(0, direct)
 
     if results:
+        # If first result still has no cover, try to find it anywhere in covers dict
+        if not results[0].get("cover") and covers:
+            results[0]["cover"] = next(iter(covers.values()), "")
         return results[:25]
 
     # Last fallback: scan homepage chapters
@@ -385,5 +422,5 @@ def search_manga(query: str) -> list[dict]:
     for ch in chapters:
         if q in ch.manga_title.lower() and ch.manga_url not in seen:
             seen.add(ch.manga_url)
-            fallback.append({"title": ch.manga_title, "url": ch.manga_url})
+            fallback.append({"title": ch.manga_title, "url": ch.manga_url, "cover": ch.cover_url})
     return fallback[:25]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import time
@@ -20,12 +21,55 @@ from .scraper import Chapter, fetch_latest_chapters, fetch_manga_chapters, fetch
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL_MINUTES      = 5
-NEWS_POLL_INTERVAL_MINUTES = 30
-ANIME_POLL_INTERVAL_MINUTES = 30
+NEWS_POLL_INTERVAL_MINUTES = 5
+ANIME_POLL_INTERVAL_MINUTES = 5
 ANIME_COLOR = 0xE8410A
 SITE_NAME  = "مانجا ستارز"
 SITE_URL   = "https://manga-starz.net"
 EMBED_COLOR = 0x1B6CA8
+
+COLOR_SUCCESS = 0x57F287
+COLOR_ERROR   = 0xED4245
+COLOR_WARN    = 0xFEE75C
+COLOR_INFO    = 0x3B82F6
+
+
+def _embed_success(msg: str) -> discord.Embed:
+    return discord.Embed(description=msg, color=COLOR_SUCCESS)
+
+
+def _embed_error(msg: str) -> discord.Embed:
+    return discord.Embed(description=msg, color=COLOR_ERROR)
+
+
+def _embed_warn(msg: str) -> discord.Embed:
+    return discord.Embed(description=msg, color=COLOR_WARN)
+
+
+def _embed_info(msg: str) -> discord.Embed:
+    return discord.Embed(description=msg, color=COLOR_INFO)
+
+
+def _download_cover_sync(url: str) -> Optional[discord.File]:
+    """Download cover using cloudscraper (bypasses Cloudflare). Runs in executor."""
+    try:
+        import cloudscraper
+        scraper = cloudscraper.create_scraper()
+        resp = scraper.get(url, timeout=12, headers={"Referer": "https://manga-starz.net/"})
+        if resp.status_code == 200:
+            ext = "jpg" if "jpeg" in resp.headers.get("Content-Type", "") or url.lower().endswith(".jpg") else "png"
+            return discord.File(io.BytesIO(resp.content), filename=f"cover.{ext}")
+    except Exception as exc:
+        log.warning("Cover download failed for %s: %s", url, exc)
+    return None
+
+
+async def _get_cover_file(cover_url: str) -> Optional[discord.File]:
+    """Async wrapper — downloads cover in thread executor."""
+    if not cover_url:
+        return None
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _download_cover_sync, cover_url)
 
 
 # ── Developer access ──────────────────────────────────────────────────────────
@@ -55,7 +99,7 @@ def dev_only():
         if await _is_developer(interaction.user.id):
             return True
         await interaction.response.send_message(
-            "❌ هذا الأمر متاح للمطورين فقط.", ephemeral=True
+            embed=_embed_error("❌ هذا الأمر متاح للمطورين فقط."), ephemeral=True
         )
         return False
     return app_commands.check(predicate)
@@ -99,12 +143,19 @@ class MangaBot(discord.Client):
         if isinstance(error, app_commands.CheckFailure):
             return
         log.error("App command error in '%s': %s", interaction.command, error, exc_info=error)
-        msg = "❌ حدث خطأ غير متوقع. حاول مجدداً أو تواصل مع المطور."
+        is_dev = await _is_developer(interaction.user.id)
+        if is_dev:
+            cmd = interaction.command.name if interaction.command else "unknown"
+            _err = _embed_error(
+                f"❌ خطأ في الأمر `/{cmd}`\n```\n{type(error).__name__}: {error}\n```"
+            )
+        else:
+            _err = _embed_warn("⚠️ صار شي ما، حاول مجدداً بعد لحظات.")
         try:
             if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
+                await interaction.followup.send(embed=_err, ephemeral=True)
             else:
-                await interaction.response.send_message(msg, ephemeral=True)
+                await interaction.response.send_message(embed=_err, ephemeral=True)
         except Exception:
             pass
 
@@ -406,8 +457,10 @@ class GoToChapterModal(discord.ui.Modal, title="اذهب لفصل محدد"):
 
         if match is None:
             await interaction.response.send_message(
-                f"❌ الفصل **{query}** غير موجود في **{self.paginator.title}**.\n"
-                f"الفصول المتاحة: {len(chapters)} فصل.",
+                embed=_embed_error(
+                    f"❌ الفصل **{query}** غير موجود في **{self.paginator.title}**.\n"
+                    f"الفصول المتاحة: {len(chapters)} فصل."
+                ),
                 ephemeral=True,
             )
             return
@@ -500,7 +553,7 @@ class ChapterPaginatorView(discord.ui.View):
     @discord.ui.button(label="🔔 متابعة", style=discord.ButtonStyle.success, row=1)
     async def watch_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not self.bot or not self.result:
-            await interaction.response.send_message("❌ غير متاح.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ غير متاح."), ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         added = await db.add_dm_subscription(
@@ -508,14 +561,14 @@ class ChapterPaginatorView(discord.ui.View):
         )
         if added:
             await interaction.followup.send(
-                f"✅ سيصلك إشعار بالخاص عند صدور فصل جديد من **{self.result['title']}**.",
+                embed=_embed_success(f"✅ سيصلك إشعار بالخاص عند صدور فصل جديد من **{self.result['title']}**."),
                 ephemeral=True,
             )
             await db.export_to_json()
             await self.bot._update_presence()
         else:
             await interaction.followup.send(
-                f"⚠️ أنت مشترك بالفعل في **{self.result['title']}**.",
+                embed=_embed_warn(f"⚠️ أنت مشترك بالفعل في **{self.result['title']}**."),
                 ephemeral=True,
             )
 
@@ -532,10 +585,11 @@ async def _load_and_show_chapters(
     )
     if not chapters:
         await interaction.edit_original_response(
-            content=(
+            embed=_embed_error(
                 f"❌ لم يتم العثور على فصول لـ **{result['title']}**.\n"
                 f"جرب مجدداً بعد لحظات أو استخدم `/watch` لمتابعة الفصول الجديدة."
-            )
+            ),
+            content=None,
         )
         return
     view = ChapterPaginatorView(result["title"], result.get("url", ""), chapters, bot=bot, result=result)
@@ -551,34 +605,45 @@ async def _do_watch_subscription(
     added = await db.add_dm_subscription(interaction.user.id, result["url"], result["title"])
     if added:
         await interaction.edit_original_response(
-            content=f"✅ سيصلك إشعار بالخاص عند صدور فصل جديد من **{result['title']}**.",
-            embed=None,
+            embed=_embed_success(f"✅ سيصلك إشعار بالخاص عند صدور فصل جديد من **{result['title']}**."),
+            content=None,
             view=None,
         )
         await db.export_to_json()
         await bot._update_presence()
     else:
         await interaction.edit_original_response(
-            content=f"⚠️ أنت مشترك بالفعل في **{result['title']}**.",
-            embed=None,
+            embed=_embed_warn(f"⚠️ أنت مشترك بالفعل في **{result['title']}**."),
+            content=None,
             view=None,
         )
 
 
 class WatchConfirmView(discord.ui.View):
-    def __init__(self, result: dict, bot: "MangaBot") -> None:
+    def __init__(self, result: dict, bot: "MangaBot", user_id: Optional[int] = None) -> None:
         super().__init__(timeout=60)
         self.result = result
         self.bot = bot
+        self.user_id = user_id
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if self.user_id and interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                embed=_embed_error("❌ هذه الرسالة ليست لك."), ephemeral=True
+            )
+            return False
+        return True
 
     @discord.ui.button(label="🔔 اشتراك", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check(interaction): return
         await interaction.response.defer()
         await _do_watch_subscription(interaction, self.result, self.bot)
 
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
+        if not await self._check(interaction): return
+        await interaction.message.delete()
 
 
 class WatchResultSelect(discord.ui.Select):
@@ -608,36 +673,58 @@ class WatchResultSelect(discord.ui.Select):
 
 
 class WatchResultsView(discord.ui.View):
-    def __init__(self, results: list[dict], bot: "MangaBot") -> None:
+    def __init__(self, results: list[dict], bot: "MangaBot", user_id: Optional[int] = None) -> None:
         super().__init__(timeout=60)
+        self.user_id = user_id
         self.add_item(WatchResultSelect(results, bot))
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if self.user_id and interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                embed=_embed_error("❌ هذه الرسالة ليست لك."), ephemeral=True
+            )
+            return False
+        return True
 
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
+        if not await self._check(interaction): return
+        await interaction.message.delete()
 
 
 class SearchConfirmView(discord.ui.View):
-    def __init__(self, result: dict, bot: "MangaBot") -> None:
+    def __init__(self, result: dict, bot: "MangaBot", user_id: Optional[int] = None) -> None:
         super().__init__(timeout=60)
         self.result = result
         self.bot = bot
+        self.user_id = user_id
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if self.user_id and interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                embed=_embed_error("❌ هذه الرسالة ليست لك."), ephemeral=True
+            )
+            return False
+        return True
 
     @discord.ui.button(label="📋 كل الفصول", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check(interaction): return
         await interaction.response.edit_message(
-            content="⏳ جاري جلب الفصول…", embed=None, view=None
+            embed=_embed_info("⏳ جاري جلب الفصول…"), content=None, view=None, attachments=[]
         )
         await _load_and_show_chapters(interaction, self.result, bot=self.bot)
 
     @discord.ui.button(label="🔔 متابعة", style=discord.ButtonStyle.primary)
     async def watch_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check(interaction): return
         await interaction.response.defer()
         await _do_watch_subscription(interaction, self.result, self.bot)
 
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
+        if not await self._check(interaction): return
+        await interaction.message.delete()
 
 
 def _slug_label(url: str) -> str:
@@ -669,19 +756,29 @@ class SearchResultSelect(discord.ui.Select):
         idx = int(self.values[0])
         result = self.results[idx]
         await interaction.response.edit_message(
-            content="⏳ جاري جلب الفصول…", embed=None, view=None
+            embed=_embed_info("⏳ جاري جلب الفصول…"), content=None, view=None
         )
         await _load_and_show_chapters(interaction, result, bot=self.bot)
 
 
 class SearchResultsView(discord.ui.View):
-    def __init__(self, results: list[dict], bot: Optional["MangaBot"] = None) -> None:
+    def __init__(self, results: list[dict], bot: Optional["MangaBot"] = None, user_id: Optional[int] = None) -> None:
         super().__init__(timeout=60)
+        self.user_id = user_id
         self.add_item(SearchResultSelect(results, bot=bot))
+
+    async def _check(self, interaction: discord.Interaction) -> bool:
+        if self.user_id and interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                embed=_embed_error("❌ هذه الرسالة ليست لك."), ephemeral=True
+            )
+            return False
+        return True
 
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
+        if not await self._check(interaction): return
+        await interaction.message.delete()
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -697,78 +794,88 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
         if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ يعمل في السيرفر فقط."), ephemeral=True)
             return
         target = channel or interaction.channel
         if not isinstance(target, discord.TextChannel):
-            await interaction.response.send_message("❌ الرجاء تحديد قناة نصية.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ الرجاء تحديد قناة نصية."), ephemeral=True)
             return
         await db.set_guild_channel(interaction.guild_id, target.id)
         await interaction.response.send_message(
-            f"✅ الإشعارات ستُرسل إلى {target.mention}", ephemeral=True
+            embed=_embed_success(f"✅ الإشعارات ستُرسل إلى {target.mention}"), ephemeral=True
         )
 
     @tree.command(name="watchall", description="[مطور] إشعارات لجميع العناوين الجديدة")
     @dev_only()
     async def watchall(interaction: discord.Interaction) -> None:
         if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ يعمل في السيرفر فقط."), ephemeral=True)
             return
         subs = await db.get_subscriptions(interaction.guild_id)
         for s in subs:
             await db.remove_subscription(interaction.guild_id, s["url"])
         await interaction.response.send_message(
-            "✅ سيتم إشعارك بجميع الفصول الجديدة من **مانجا ستارز**.", ephemeral=True
+            embed=_embed_success("✅ سيتم إشعارك بجميع الفصول الجديدة من **مانجا ستارز**."), ephemeral=True
         )
 
     @tree.command(name="check", description="[مطور] فحص الفصول الجديدة فوراً")
     @dev_only()
     async def check_now(interaction: discord.Interaction) -> None:
         if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ يعمل في السيرفر فقط."), ephemeral=True)
             return
-        await interaction.response.send_message("🔍 جاري الفحص…", ephemeral=True)
+        await interaction.response.send_message(embed=_embed_info("🔍 جاري الفحص…"), ephemeral=True)
         await bot._check_for_new_chapters()
         await interaction.edit_original_response(
-            content="✅ تم الفحص! الفصول الجديدة ستظهر في القناة المحددة."
+            embed=_embed_success("✅ تم الفحص! الفصول الجديدة ستظهر في القناة المحددة.")
         )
 
     @tree.command(name="adddev", description="[مطور] إضافة مطور جديد بواسطة User ID")
     @dev_only()
     async def adddev(interaction: discord.Interaction, user_id: str) -> None:
         if not user_id.isdigit():
-            await interaction.response.send_message("❌ الـ ID يجب أن يكون رقماً.", ephemeral=True)
-            return
-        uid = int(user_id)
-        env_ids = _load_env_dev_ids()
-        if uid in env_ids:
-            await interaction.response.send_message("⚠️ هذا الـ ID مضاف مسبقاً في المتغيرات البيئية.", ephemeral=True)
-            return
-        added = await db.add_db_developer_id(uid)
-        if not added:
-            await interaction.response.send_message("⚠️ هذا الـ ID مضاف مسبقاً.", ephemeral=True)
-            return
-        await interaction.response.send_message(f"✅ تمت إضافة `{user_id}` للمطورين (يُحفظ في قاعدة البيانات).", ephemeral=True)
-
-    @tree.command(name="removedev", description="[مطور] إزالة مطور بواسطة User ID")
-    @dev_only()
-    async def removedev(interaction: discord.Interaction, user_id: str) -> None:
-        if not user_id.isdigit():
-            await interaction.response.send_message("❌ الـ ID يجب أن يكون رقماً.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ الـ ID يجب أن يكون رقماً."), ephemeral=True)
             return
         uid = int(user_id)
         env_ids = _load_env_dev_ids()
         if uid in env_ids:
             await interaction.response.send_message(
-                "❌ هذا الـ ID محدد في المتغيرات البيئية `DEVELOPER_IDS` ولا يمكن حذفه من هنا.",
+                embed=_embed_warn("⚠️ هذا الـ ID مضاف مسبقاً في المتغيرات البيئية."), ephemeral=True
+            )
+            return
+        added = await db.add_db_developer_id(uid)
+        if not added:
+            await interaction.response.send_message(embed=_embed_warn("⚠️ هذا الـ ID مضاف مسبقاً."), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=_embed_success(f"✅ تمت إضافة `{user_id}` للمطورين (يُحفظ في قاعدة البيانات)."), ephemeral=True
+        )
+
+    @tree.command(name="removedev", description="[مطور] إزالة مطور بواسطة User ID")
+    @dev_only()
+    async def removedev(interaction: discord.Interaction, user_id: str) -> None:
+        if not user_id.isdigit():
+            await interaction.response.send_message(embed=_embed_error("❌ الـ ID يجب أن يكون رقماً."), ephemeral=True)
+            return
+        uid = int(user_id)
+        env_ids = _load_env_dev_ids()
+        if uid in env_ids:
+            await interaction.response.send_message(
+                embed=_embed_error(
+                    "❌ هذا الـ ID محدد في المتغيرات البيئية `DEVELOPER_IDS` ولا يمكن حذفه من هنا."
+                ),
                 ephemeral=True,
             )
             return
         removed = await db.remove_db_developer_id(uid)
         if not removed:
-            await interaction.response.send_message("❌ هذا الـ ID غير موجود في قائمة المطورين.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=_embed_error("❌ هذا الـ ID غير موجود في قائمة المطورين."), ephemeral=True
+            )
             return
-        await interaction.response.send_message(f"✅ تمت إزالة `{user_id}` من المطورين.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=_embed_success(f"✅ تمت إزالة `{user_id}` من المطورين."), ephemeral=True
+        )
 
     @tree.command(name="listdevs", description="[مطور] عرض قائمة المطورين")
     @dev_only()
@@ -777,41 +884,53 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         db_ids = await db.get_db_developer_ids()
         all_ids = env_ids | db_ids
         if not all_ids:
-            await interaction.response.send_message("📋 لا يوجد مطورون مضافون.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_info("📋 لا يوجد مطورون مضافون."), ephemeral=True)
             return
         lines = []
         for uid in sorted(all_ids):
             source = "🔒 env" if uid in env_ids else "💾 db"
             lines.append(f"• `{uid}` ({source})")
-        await interaction.response.send_message(
-            "👨‍💻 **المطورون:**\n" + "\n".join(lines), ephemeral=True
+        embed = discord.Embed(
+            title="👨‍💻 المطورون",
+            description="\n".join(lines),
+            color=EMBED_COLOR,
         )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── عام (الكل يستخدمها) ──────────────────────────────────────────────────
 
     @tree.command(name="search", description="ابحث عن مانغا/مانهوا/مانها وشوف فصولها")
     async def search(interaction: discord.Interaction, الاسم: str) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(None, search_manga, الاسم)
         if not results:
             await interaction.followup.send(
-                f"❌ لم أجد **{الاسم}** في مانجا ستارز.", ephemeral=True
+                embed=_embed_error(f"❌ لم أجد **{الاسم}** في مانجا ستارز."), ephemeral=True
             )
             return
+        user_id = interaction.user.id
         if len(results) == 1:
             best = results[0]
+            cover_file = await _get_cover_file(best.get("cover", ""))
             embed = discord.Embed(
                 title=best["title"],
                 url=best.get("url", SITE_URL),
                 color=EMBED_COLOR,
             )
-            embed.set_author(name="🔍 هل تقصد هذا؟")
-            embed.set_footer(text=SITE_NAME, icon_url=_FOOTER_ICON)
-            view = SearchConfirmView(best, bot)
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            embed.set_author(name="🔍 هل تقصد هذا؟", icon_url=_FOOTER_ICON)
+            if cover_file:
+                embed.set_image(url=f"attachment://{cover_file.filename}")
+            embed.set_footer(text=f"{SITE_NAME}  •  اضغط زر الفصول أو المتابعة أدناه", icon_url=_FOOTER_ICON)
+            view = SearchConfirmView(best, bot, user_id=user_id)
+            kwargs = dict(embed=embed, view=view)
+            if cover_file:
+                kwargs["file"] = cover_file
+            await interaction.followup.send(**kwargs)
         else:
             shown = min(len(results), 25)
+            best = results[0]
+            cover_file = await _get_cover_file(best.get("cover", ""))
             list_lines = [
                 f"`{i+1}.` [{r['title']}]({r['url']})" if r.get("url") else f"`{i+1}.` {r['title']}"
                 for i, r in enumerate(results[:shown])
@@ -821,47 +940,66 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 description="\n".join(list_lines),
                 color=EMBED_COLOR,
             )
-            embed.set_author(name="🔍 بحث")
+            embed.set_author(name="🔍 بحث", icon_url=_FOOTER_ICON)
+            if cover_file:
+                embed.set_thumbnail(url=f"attachment://{cover_file.filename}")
             embed.set_footer(
                 text=f"{SITE_NAME}  •  {shown} نتيجة — اختر من القائمة أدناه",
                 icon_url=_FOOTER_ICON,
             )
-            view = SearchResultsView(results, bot=bot)
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            view = SearchResultsView(results, bot=bot, user_id=user_id)
+            kwargs = dict(embed=embed, view=view)
+            if cover_file:
+                kwargs["file"] = cover_file
+            await interaction.followup.send(**kwargs)
 
     @tree.command(name="watch", description="تلقي إشعارات بالخاص عند صدور فصل جديد")
     async def watch(interaction: discord.Interaction, الاسم: str) -> None:
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         loop = asyncio.get_running_loop()
         results = await loop.run_in_executor(None, search_manga, الاسم)
         if not results:
             await interaction.followup.send(
-                f"❌ لم أجد **{الاسم}** في مانجا ستارز.", ephemeral=True
+                embed=_embed_error(f"❌ لم أجد **{الاسم}** في مانجا ستارز."), ephemeral=True
             )
             return
 
+        user_id = interaction.user.id
         if len(results) == 1:
             best = results[0]
+            cover_file = await _get_cover_file(best.get("cover", ""))
             embed = discord.Embed(
                 title=best["title"],
                 url=best.get("url", SITE_URL),
                 color=EMBED_COLOR,
             )
-            embed.set_author(name="🔔 هل تريد تلقي إشعارات لهذا العنوان؟")
+            embed.set_author(name="🔔 هل تريد تلقي إشعارات لهذا العنوان؟", icon_url=_FOOTER_ICON)
+            if cover_file:
+                embed.set_image(url=f"attachment://{cover_file.filename}")
             embed.set_footer(text=SITE_NAME, icon_url=_FOOTER_ICON)
-            view = WatchConfirmView(best, bot)
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            view = WatchConfirmView(best, bot, user_id=user_id)
+            kwargs = dict(embed=embed, view=view)
+            if cover_file:
+                kwargs["file"] = cover_file
+            await interaction.followup.send(**kwargs)
         else:
             shown = min(len(results), 25)
+            best = results[0]
+            cover_file = await _get_cover_file(best.get("cover", ""))
             embed = discord.Embed(
                 title=f"اشتراك في: {الاسم}",
                 description=f"وُجد **{shown}** نتيجة — اختر العنوان الصحيح لمتابعته:",
                 color=EMBED_COLOR,
             )
-            embed.set_author(name="🔔 متابعة عنوان")
+            embed.set_author(name="🔔 متابعة عنوان", icon_url=_FOOTER_ICON)
+            if cover_file:
+                embed.set_thumbnail(url=f"attachment://{cover_file.filename}")
             embed.set_footer(text=SITE_NAME, icon_url=_FOOTER_ICON)
-            view = WatchResultsView(results, bot)
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            view = WatchResultsView(results, bot, user_id=user_id)
+            kwargs = dict(embed=embed, view=view)
+            if cover_file:
+                kwargs["file"] = cover_file
+            await interaction.followup.send(**kwargs)
 
     @tree.command(name="unwatch", description="إيقاف إشعارات الخاص لمانغا/مانهوا معينة")
     async def unwatch(interaction: discord.Interaction, الاسم: str) -> None:
@@ -870,12 +1008,12 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         match = next((s for s in subs if query in s["title"].lower()), None)
         if not match:
             await interaction.response.send_message(
-                f"❌ لم أجد **{الاسم}** في قائمة اشتراكاتك.", ephemeral=True
+                embed=_embed_error(f"❌ لم أجد **{الاسم}** في قائمة اشتراكاتك."), ephemeral=True
             )
             return
         await db.remove_dm_subscription(interaction.user.id, match["url"])
         await interaction.response.send_message(
-            f"✅ تم إيقاف إشعارات الخاص لـ **{match['title']}**.", ephemeral=True
+            embed=_embed_success(f"✅ تم إيقاف إشعارات الخاص لـ **{match['title']}**."), ephemeral=True
         )
         await bot._update_presence()
 
@@ -884,7 +1022,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         subs = await db.get_dm_subscriptions(interaction.user.id)
         if not subs:
             await interaction.response.send_message(
-                "📋 لا توجد اشتراكات. استخدم `/watch` لإضافة عنوان.", ephemeral=True
+                embed=_embed_info("📋 لا توجد اشتراكات. استخدم `/watch` لإضافة عنوان."), ephemeral=True
             )
             return
         lines = [f"`{i+1}.` [{s['title']}]({s['url']})" for i, s in enumerate(subs)]
@@ -907,10 +1045,10 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         try:
             chapters = await loop.run_in_executor(None, fetch_latest_chapters)
         except Exception:
-            await interaction.followup.send("❌ فشل جلب البيانات، حاول مجدداً.", ephemeral=True)
+            await interaction.followup.send(embed=_embed_error("❌ فشل جلب البيانات، حاول مجدداً."), ephemeral=True)
             return
         if not chapters:
-            await interaction.followup.send("❌ لم يتم العثور على فصول.", ephemeral=True)
+            await interaction.followup.send(embed=_embed_error("❌ لم يتم العثور على فصول."), ephemeral=True)
             return
 
         seen: set[str] = set()
@@ -946,23 +1084,28 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
         if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ يعمل في السيرفر فقط."), ephemeral=True)
             return
         target = channel or interaction.channel
         if not isinstance(target, discord.TextChannel):
-            await interaction.response.send_message("❌ الرجاء تحديد قناة نصية.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ الرجاء تحديد قناة نصية."), ephemeral=True)
             return
         await db.set_news_channel(interaction.guild_id, target.id)
         await interaction.response.send_message(
-            f"✅ أخبار الأنمي ستُرسل إلى {target.mention} (كل {NEWS_POLL_INTERVAL_MINUTES} دقيقة)", ephemeral=True
+            embed=_embed_success(
+                f"✅ أخبار الأنمي ستُرسل إلى {target.mention} (كل {NEWS_POLL_INTERVAL_MINUTES} دقيقة)"
+            ),
+            ephemeral=True,
         )
 
     @tree.command(name="checknews", description="[مطور] فحص أخبار الأنمي فوراً")
     @dev_only()
     async def checknews(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message("🔍 جاري فحص أخبار الأنمي…", ephemeral=True)
+        await interaction.response.send_message(embed=_embed_info("🔍 جاري فحص أخبار الأنمي…"), ephemeral=True)
         await bot._check_for_new_tweets()
-        await interaction.edit_original_response(content="✅ تم الفحص! الأخبار الجديدة ستظهر في القناة المحددة.")
+        await interaction.edit_original_response(
+            embed=_embed_success("✅ تم الفحص! الأخبار الجديدة ستظهر في القناة المحددة.")
+        )
 
     @tree.command(name="latestnews", description="آخر 5 أخبار أنمي من @CrunchyrollMENA")
     async def latestnews(interaction: discord.Interaction) -> None:
@@ -976,7 +1119,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 pass
         if not tweets:
             await interaction.followup.send(
-                "⏳ لم تُجلب الأخبار بعد — حاول بعد قليل أو استخدم `/checknews`.",
+                embed=_embed_info("⏳ لم تُجلب الأخبار بعد — حاول بعد قليل أو استخدم `/checknews`."),
                 ephemeral=True,
             )
             return
@@ -991,24 +1134,28 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
         if not interaction.guild_id:
-            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ يعمل في السيرفر فقط."), ephemeral=True)
             return
         target = channel or interaction.channel
         if not isinstance(target, discord.TextChannel):
-            await interaction.response.send_message("❌ الرجاء تحديد قناة نصية.", ephemeral=True)
+            await interaction.response.send_message(embed=_embed_error("❌ الرجاء تحديد قناة نصية."), ephemeral=True)
             return
         await db.set_anime_notify_channel(interaction.guild_id, target.id)
         await interaction.response.send_message(
-            f"✅ إشعارات حلقات الأنمي ستُرسل إلى {target.mention} (كل {ANIME_POLL_INTERVAL_MINUTES} دقيقة)",
+            embed=_embed_success(
+                f"✅ إشعارات حلقات الأنمي ستُرسل إلى {target.mention} (كل {ANIME_POLL_INTERVAL_MINUTES} دقيقة)"
+            ),
             ephemeral=True,
         )
 
     @tree.command(name="checkanime", description="[مطور] فحص حلقات الأنمي فوراً")
     @dev_only()
     async def checkanime(interaction: discord.Interaction) -> None:
-        await interaction.response.send_message("🔍 جاري فحص حلقات الأنمي…", ephemeral=True)
+        await interaction.response.send_message(embed=_embed_info("🔍 جاري فحص حلقات الأنمي…"), ephemeral=True)
         await bot._check_for_new_episodes()
-        await interaction.edit_original_response(content="✅ تم الفحص! الحلقات الجديدة ستظهر في القناة المحددة.")
+        await interaction.edit_original_response(
+            embed=_embed_success("✅ تم الفحص! الحلقات الجديدة ستظهر في القناة المحددة.")
+        )
 
     @tree.command(name="schedule", description="مواعيد حلقات الأنمي اليوم أو هذا الأسبوع")
     async def schedule(
@@ -1025,10 +1172,10 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 episodes = await loop.run_in_executor(None, fetch_airing_today)
                 title = "📅 حلقات الأنمي — اليوم"
         except Exception:
-            await interaction.followup.send("❌ فشل جلب البيانات، حاول مجدداً.", ephemeral=True)
+            await interaction.followup.send(embed=_embed_error("❌ فشل جلب البيانات، حاول مجدداً."), ephemeral=True)
             return
         if not episodes:
-            await interaction.followup.send("📭 لا توجد حلقات في هذا النطاق الزمني.", ephemeral=True)
+            await interaction.followup.send(embed=_embed_info("📭 لا توجد حلقات في هذا النطاق الزمني."), ephemeral=True)
             return
         embed = _build_schedule_embed(episodes, title)
         await interaction.followup.send(embed=embed, ephemeral=True)

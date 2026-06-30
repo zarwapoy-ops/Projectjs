@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 ACCOUNT        = "CrunchyrollMENA"
 ACCOUNT_ID     = "3095710434"          # Stable numeric ID for @CrunchyrollMENA
 X_URL          = f"https://x.com/{ACCOUNT}"
-CACHE_TTL      = 1800                  # 30 minutes — matches the polling interval
+CACHE_TTL      = 300                   # 5 minutes — matches the polling interval
 GUEST_TTL      = 10800                 # Guest tokens last ~3 hours
 TWEET_MAX_AGE  = timedelta(days=365)   # Ignore tweets older than 1 year
 _TWITTER_EPOCH = 1288834974657         # ms — Twitter's Snowflake epoch
