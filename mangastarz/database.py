@@ -74,6 +74,11 @@ async def init_db() -> None:
                 seen_at    TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (media_id, episode)
             );
+
+            CREATE TABLE IF NOT EXISTS developer_ids (
+                user_id INTEGER PRIMARY KEY,
+                added_at TEXT DEFAULT (datetime('now'))
+            );
             """
         )
         await db.commit()
@@ -317,6 +322,36 @@ async def mark_episode_seen(media_id: int, episode: int) -> None:
             (media_id, episode),
         )
         await db.commit()
+
+
+# ── Developer IDs (persistent) ────────────────────────────────────────────────
+
+async def get_db_developer_ids() -> set[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM developer_ids") as cur:
+            rows = await cur.fetchall()
+            return {r[0] for r in rows}
+
+
+async def add_db_developer_id(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO developer_ids (user_id) VALUES (?)", (user_id,)
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def remove_db_developer_id(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM developer_ids WHERE user_id = ?", (user_id,)
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 
 # ── JSON backup ───────────────────────────────────────────────────────────────
