@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Optional
 
 import discord
@@ -12,6 +13,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from . import database as db
+from .anime import AiringEpisode, fetch_airing_today, fetch_airing_week
 from .news import Tweet, fetch_latest_tweets, get_cached_tweets
 from .scraper import Chapter, fetch_latest_chapters, fetch_manga_chapters, fetch_series_type, search_manga
 
@@ -19,6 +21,8 @@ log = logging.getLogger(__name__)
 
 POLL_INTERVAL_MINUTES      = 5
 NEWS_POLL_INTERVAL_MINUTES = 30
+ANIME_POLL_INTERVAL_MINUTES = 30
+ANIME_COLOR = 0xE8410A
 SITE_NAME  = "مانجا ستارز"
 SITE_URL   = "https://manga-starz.net"
 EMBED_COLOR = 0x1B6CA8
@@ -55,50 +59,47 @@ def dev_only():
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
+_DEFAULT_ACTIVITY = discord.Activity(
+    type=discord.ActivityType.watching,
+    name="manga-starz.net",
+)
+
+
 class MangaBot(discord.Client):
     def __init__(self) -> None:
-        intents = discord.Intents.default()
-        super().__init__(intents=intents)
+        super().__init__(
+            intents=discord.Intents.default(),
+            activity=_DEFAULT_ACTIVITY,
+            status=discord.Status.idle,
+        )
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         await db.init_db()
+        await db.export_to_json()
         _register_commands(self.tree, self)
         await self.tree.sync()
         self.poll_loop.start()
         self.news_loop.start()
+        self.anime_loop.start()
         log.info("Bot ready. Polling every %d minutes.", POLL_INTERVAL_MINUTES)
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id)
-        await self._update_presence()
 
     async def _update_presence(self) -> None:
-        guild_channels = await db.get_all_guild_channels()
-        guild_name = ""
-        for guild_id, _ in guild_channels:
-            guild = self.get_guild(guild_id)
-            if guild:
-                guild_name = guild.name
-                break
         sub_count = await db.get_dm_user_count()
-
-        watching = discord.Activity(
-            type=discord.ActivityType.watching,
-            name=guild_name or "manga-starz.net",
-        )
-        custom = discord.CustomActivity(name=f"{sub_count} subscribers")
-
-        payload = {
-            "op": self.ws.PRESENCE,
-            "d": {
-                "activities": [watching.to_dict(), custom.to_dict()],
-                "afk": False,
-                "since": 0,
-                "status": "idle",
-            },
-        }
-        await self.ws.send(discord.utils._to_json(payload))
+        try:
+            await self.change_presence(
+                status=discord.Status.idle,
+                activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"manga-starz.net • {sub_count} subscriber{'s' if sub_count != 1 else ''}",
+                ),
+            )
+            log.info("Presence updated — idle | %d مشترك", sub_count)
+        except Exception as exc:
+            log.error("Presence update failed: %s", exc)
 
     @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
     async def poll_loop(self) -> None:
@@ -108,6 +109,7 @@ class MangaBot(discord.Client):
     async def before_poll(self) -> None:
         await self.wait_until_ready()
         await asyncio.sleep(5)
+        await self._update_presence()
 
     @tasks.loop(minutes=NEWS_POLL_INTERVAL_MINUTES)
     async def news_loop(self) -> None:
@@ -117,6 +119,45 @@ class MangaBot(discord.Client):
     async def before_news_loop(self) -> None:
         await self.wait_until_ready()
         await asyncio.sleep(15)
+
+    @tasks.loop(minutes=ANIME_POLL_INTERVAL_MINUTES)
+    async def anime_loop(self) -> None:
+        await self._check_for_new_episodes()
+
+    @anime_loop.before_loop
+    async def before_anime_loop(self) -> None:
+        await self.wait_until_ready()
+        await asyncio.sleep(20)
+
+    async def _check_for_new_episodes(self) -> None:
+        channels = await db.get_all_anime_notify_channels()
+        if not channels:
+            return
+        log.info("Checking for new anime episodes…")
+        loop = asyncio.get_running_loop()
+        try:
+            episodes: list[AiringEpisode] = await loop.run_in_executor(None, fetch_airing_today)
+        except Exception as exc:
+            log.error("Anime fetch error: %s", exc)
+            return
+
+        new_count = 0
+        for ep in episodes:
+            if await db.is_episode_seen(ep.media_id, ep.episode):
+                continue
+            await db.mark_episode_seen(ep.media_id, ep.episode)
+            new_count += 1
+            embed = _build_episode_embed(ep)
+            for guild_id, channel_id in channels:
+                channel = self.get_channel(channel_id)
+                if channel and isinstance(channel, discord.TextChannel):
+                    try:
+                        await channel.send(embed=embed)
+                    except discord.Forbidden:
+                        log.warning("No permission in anime channel %d", channel_id)
+                    except Exception as exc:
+                        log.error("Anime send failed: %s", exc)
+        log.info("Anime check done. %d new episode(s).", new_count)
 
     async def _check_for_new_tweets(self) -> None:
         log.info("Checking for new tweets from @CrunchyrollMENA…")
@@ -213,6 +254,35 @@ class MangaBot(discord.Client):
 
 
 NEWS_COLOR = 0x1DA1F2  # Twitter/X blue
+
+
+def _build_episode_embed(ep: AiringEpisode) -> discord.Embed:
+    from datetime import timezone
+    embed = discord.Embed(
+        title=f"🎌 {ep.title}",
+        description=f"**الحلقة {ep.episode}** متاحة الآن!",
+        url=ep.site_url,
+        color=ANIME_COLOR,
+        timestamp=ep.airing_dt,
+    )
+    if ep.cover_url:
+        embed.set_thumbnail(url=ep.cover_url)
+    embed.set_footer(text="AniList • جدول الأنمي")
+    return embed
+
+
+def _build_schedule_embed(episodes: list[AiringEpisode], title: str) -> discord.Embed:
+    from datetime import timezone
+    embed = discord.Embed(title=title, color=ANIME_COLOR)
+    for ep in episodes[:20]:
+        ts = f"<t:{ep.airing_at}:R>"
+        embed.add_field(
+            name=ep.title[:50],
+            value=f"الحلقة {ep.episode} — {ts}",
+            inline=False,
+        )
+    embed.set_footer(text="AniList • aniseason.com")
+    return embed
 
 
 def _build_tweet_embeds(tweet: Tweet) -> list[discord.Embed]:
@@ -573,6 +643,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             await interaction.followup.send(
                 f"✅ سيصلك إشعار بالخاص عند صدور فصل جديد من **{best['title']}**.", ephemeral=True
             )
+            await db.export_to_json()
             await bot._update_presence()
         else:
             await interaction.followup.send(
@@ -691,6 +762,55 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         for tweet in tweets[:5]:
             embeds = _build_tweet_embeds(tweet)
             await interaction.followup.send(embeds=embeds)
+
+    @tree.command(name="setanimechannel", description="[مطور] تعيين قناة إشعارات حلقات الأنمي")
+    @dev_only()
+    async def setanimechannel(
+        interaction: discord.Interaction,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if not interaction.guild_id:
+            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+            return
+        target = channel or interaction.channel
+        if not isinstance(target, discord.TextChannel):
+            await interaction.response.send_message("❌ الرجاء تحديد قناة نصية.", ephemeral=True)
+            return
+        await db.set_anime_notify_channel(interaction.guild_id, target.id)
+        await interaction.response.send_message(
+            f"✅ إشعارات حلقات الأنمي ستُرسل إلى {target.mention} (كل {ANIME_POLL_INTERVAL_MINUTES} دقيقة)",
+            ephemeral=True,
+        )
+
+    @tree.command(name="checkanime", description="[مطور] فحص حلقات الأنمي فوراً")
+    @dev_only()
+    async def checkanime(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message("🔍 جاري فحص حلقات الأنمي…", ephemeral=True)
+        await bot._check_for_new_episodes()
+        await interaction.edit_original_response(content="✅ تم الفحص! الحلقات الجديدة ستظهر في القناة المحددة.")
+
+    @tree.command(name="schedule", description="مواعيد حلقات الأنمي اليوم أو هذا الأسبوع")
+    async def schedule(
+        interaction: discord.Interaction,
+        نطاق: Optional[str] = "today",
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
+        try:
+            if نطاق and "week" in نطاق.lower():
+                episodes = await loop.run_in_executor(None, fetch_airing_week)
+                title = "📅 حلقات الأنمي — هذا الأسبوع"
+            else:
+                episodes = await loop.run_in_executor(None, fetch_airing_today)
+                title = "📅 حلقات الأنمي — اليوم"
+        except Exception:
+            await interaction.followup.send("❌ فشل جلب البيانات، حاول مجدداً.", ephemeral=True)
+            return
+        if not episodes:
+            await interaction.followup.send("📭 لا توجد حلقات في هذا النطاق الزمني.", ephemeral=True)
+            return
+        embed = _build_schedule_embed(episodes, title)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @tree.command(name="status", description="حالة البوت واشتراكاتك")
     async def status(interaction: discord.Interaction) -> None:

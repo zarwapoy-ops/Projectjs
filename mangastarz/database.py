@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+from datetime import datetime, timezone
+
 import aiosqlite
 
-DB_PATH = "mangastarz_bot.db"
+DB_PATH   = "mangastarz_bot.db"
+JSON_PATH = "data_backup.json"
+
+log = logging.getLogger(__name__)
 
 
 async def init_db() -> None:
@@ -53,6 +61,18 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS seen_tweets (
                 tweet_id TEXT PRIMARY KEY,
                 seen_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS anime_notify_channels (
+                guild_id   INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS seen_episodes (
+                media_id   INTEGER NOT NULL,
+                episode    INTEGER NOT NULL,
+                seen_at    TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (media_id, episode)
             );
             """
         )
@@ -262,3 +282,95 @@ async def mark_tweet_seen(tweet_id: str) -> None:
             "INSERT OR IGNORE INTO seen_tweets (tweet_id) VALUES (?)", (tweet_id,)
         )
         await db.commit()
+
+
+# ── Anime notifications ───────────────────────────────────────────────────────
+
+async def set_anime_notify_channel(guild_id: int, channel_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO anime_notify_channels (guild_id, channel_id) VALUES (?,?)",
+            (guild_id, channel_id),
+        )
+        await db.commit()
+
+
+async def get_all_anime_notify_channels() -> list[tuple[int, int]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT guild_id, channel_id FROM anime_notify_channels") as cur:
+            return await cur.fetchall()
+
+
+async def is_episode_seen(media_id: int, episode: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM seen_episodes WHERE media_id=? AND episode=?",
+            (media_id, episode),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def mark_episode_seen(media_id: int, episode: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO seen_episodes (media_id, episode) VALUES (?,?)",
+            (media_id, episode),
+        )
+        await db.commit()
+
+
+# ── JSON backup ───────────────────────────────────────────────────────────────
+
+async def export_to_json() -> str:
+    """Export all bot data to JSON_PATH and return the path."""
+    data: dict = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "guild_channels": [],
+        "news_channels": [],
+        "subscriptions": [],
+        "user_dm_subscriptions": [],
+        "seen_chapters": [],
+        "seen_tweets": [],
+        "series_type_cache": [],
+    }
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        async with db.execute("SELECT guild_id, channel_id FROM guild_channels") as cur:
+            data["guild_channels"] = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute("SELECT guild_id, channel_id FROM news_channels") as cur:
+            data["news_channels"] = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT guild_id, manga_url, manga_title FROM subscriptions"
+        ) as cur:
+            data["subscriptions"] = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT user_id, manga_url, manga_title FROM user_dm_subscriptions"
+        ) as cur:
+            data["user_dm_subscriptions"] = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT chapter_url, manga_title, chapter_num, seen_at FROM seen_chapters ORDER BY seen_at DESC"
+        ) as cur:
+            data["seen_chapters"] = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute("SELECT tweet_id, seen_at FROM seen_tweets") as cur:
+            data["seen_tweets"] = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT manga_url, series_type, cached_at FROM series_type_cache"
+        ) as cur:
+            data["series_type_cache"] = [dict(r) for r in await cur.fetchall()]
+
+    with open(JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    log.info("[db] JSON backup saved → %s (%d subs, %d chapters seen)",
+             JSON_PATH,
+             len(data["user_dm_subscriptions"]),
+             len(data["seen_chapters"]))
+    return JSON_PATH
