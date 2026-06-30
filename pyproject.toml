@@ -10,5 +10,6 @@ dependencies = [
     "cloudscraper>=1.2.71",
     "discord-py>=2.7.1",
     "feedparser>=6.0.12",
+    "requests>=2.34.2",
     "tweety-ns>=2.4.1",
 ]

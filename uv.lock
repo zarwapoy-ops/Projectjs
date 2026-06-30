@@ -947,6 +947,7 @@ dependencies = [
     { name = "cloudscraper" },
     { name = "discord-py" },
     { name = "feedparser" },
+    { name = "requests" },
     { name = "tweety-ns" },
 ]
 
@@ -958,6 +959,7 @@ requires-dist = [
     { name = "cloudscraper", specifier = ">=1.2.71" },
     { name = "discord-py", specifier = ">=2.7.1" },
     { name = "feedparser", specifier = ">=6.0.12" },
+    { name = "requests", specifier = ">=2.34.2" },
     { name = "tweety-ns", specifier = ">=2.4.1" },
 ]
 
