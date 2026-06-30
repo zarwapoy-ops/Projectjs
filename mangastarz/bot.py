@@ -78,12 +78,11 @@ class MangaBot(discord.Client):
             if guild:
                 guild_name = guild.name
                 break
-        label = guild_name if guild_name else "manga-starz.net"
+        sub_count = await db.get_dm_user_count()
         await self.change_presence(
             status=discord.Status.idle,
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name=label,
+            activity=discord.CustomActivity(
+                name=f"👥 {sub_count} مشترك",
             ),
         )
 
@@ -177,12 +176,59 @@ def _build_chapter_embed(ch: Chapter, series_type: str = "") -> discord.Embed:
 
 # ── UI Views ──────────────────────────────────────────────────────────────────
 
-CHAPTERS_PER_PAGE = 10
+CHAPTERS_PER_PAGE = 60
+
+
+class GoToChapterModal(discord.ui.Modal, title="اذهب لفصل محدد"):
+    chapter_input = discord.ui.TextInput(
+        label="رقم الفصل",
+        placeholder="مثال: 50",
+        required=True,
+        max_length=10,
+    )
+
+    def __init__(self, paginator: "ChapterPaginatorView") -> None:
+        super().__init__()
+        self.paginator = paginator
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        import re
+        query = self.chapter_input.value.strip()
+        chapters = self.paginator.chapters
+
+        # Extract the numeric part from the query for exact comparison
+        query_nums = re.findall(r'\d+(?:\.\d+)?', query)
+        query_num = query_nums[0] if query_nums else None
+
+        def _chapter_num_matches(ch_label: str) -> bool:
+            if not query_num:
+                return ch_label.strip() == query
+            nums = re.findall(r'\d+(?:\.\d+)?', ch_label)
+            return any(n == query_num for n in nums)
+
+        match = next((ch for ch in chapters if _chapter_num_matches(ch["num"])), None)
+
+        if match is None:
+            await interaction.response.send_message(
+                f"❌ الفصل **{query}** غير موجود في **{self.paginator.title}**.\n"
+                f"الفصول المتاحة: {len(chapters)} فصل.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"📖 {self.paginator.title}",
+            url=self.paginator.manga_url,
+            description=f"[{match['num']}]({match['url']})",
+            color=EMBED_COLOR,
+        )
+        embed.set_footer(text=SITE_NAME)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class ChapterPaginatorView(discord.ui.View):
     def __init__(self, title: str, manga_url: str, chapters: list[dict]) -> None:
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)
         self.title = title
         self.manga_url = manga_url
         self.chapters = chapters
@@ -205,20 +251,47 @@ class ChapterPaginatorView(discord.ui.View):
             description="\n".join(lines) if lines else "لا توجد فصول.",
             color=EMBED_COLOR,
         )
-        embed.set_footer(text=f"صفحة {self.page + 1} / {self.total_pages}  •  {SITE_NAME}")
+        embed.set_footer(
+            text=f"صفحة {self.page + 1} / {self.total_pages}  •  {len(self.chapters)} فصل  •  {SITE_NAME}"
+        )
         return embed
 
-    @discord.ui.button(label="◀ السابق", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="◀ السابق", style=discord.ButtonStyle.secondary, row=0)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.page -= 1
         self._refresh_buttons()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="التالي ▶", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="التالي ▶", style=discord.ButtonStyle.secondary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.page += 1
         self._refresh_buttons()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="🔢 اذهب لفصل", style=discord.ButtonStyle.primary, row=0)
+    async def goto_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(GoToChapterModal(self))
+
+
+async def _load_and_show_chapters(
+    interaction: discord.Interaction,
+    result: dict,
+) -> None:
+    """Fetch chapters and display paginator. Edits the original response."""
+    loop = asyncio.get_running_loop()
+    chapters = await loop.run_in_executor(
+        None, fetch_manga_chapters, result["title"], result.get("url", "")
+    )
+    if not chapters:
+        await interaction.edit_original_response(
+            content=(
+                f"❌ لم يتم العثور على فصول لـ **{result['title']}**.\n"
+                f"جرب مجدداً بعد لحظات أو استخدم `/watch` لمتابعة الفصول الجديدة."
+            )
+        )
+        return
+    view = ChapterPaginatorView(result["title"], result["url"], chapters)
+    await interaction.edit_original_response(content=None, embed=view.build_embed(), view=view)
 
 
 class SearchConfirmView(discord.ui.View):
@@ -226,27 +299,14 @@ class SearchConfirmView(discord.ui.View):
         super().__init__(timeout=60)
         self.result = result
 
-    @discord.ui.button(label="✅ نعم", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="📋 كل الفصول", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.edit_message(
             content="⏳ جاري جلب الفصول…", embed=None, view=None
         )
-        loop = asyncio.get_running_loop()
-        chapters = await loop.run_in_executor(
-            None, fetch_manga_chapters, self.result["title"]
-        )
-        if not chapters:
-            await interaction.edit_original_response(
-                content=(
-                    f"❌ لم يتم العثور على فصول لـ **{self.result['title']}**.\n"
-                    f"جرب مجدداً بعد لحظات أو استخدم `/watch` لمتابعة الفصول الجديدة."
-                )
-            )
-            return
-        view = ChapterPaginatorView(self.result["title"], self.result["url"], chapters)
-        await interaction.edit_original_response(content=None, embed=view.build_embed(), view=view)
+        await _load_and_show_chapters(interaction, self.result)
 
-    @discord.ui.button(label="❌ لا", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
 
@@ -377,6 +437,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             await interaction.followup.send(
                 f"✅ سيصلك إشعار بالخاص عند صدور فصل جديد من **{best['title']}**.", ephemeral=True
             )
+            await bot._update_presence()
         else:
             await interaction.followup.send(
                 f"⚠️ أنت مشترك بالفعل في **{best['title']}**.", ephemeral=True
@@ -396,6 +457,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         await interaction.response.send_message(
             f"✅ تم إيقاف إشعارات الخاص لـ **{match['title']}**.", ephemeral=True
         )
+        await bot._update_presence()
 
     @tree.command(name="list", description="عرض العناوين التي تتلقى إشعاراتها بالخاص")
     async def list_subs(interaction: discord.Interaction) -> None:
