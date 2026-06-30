@@ -44,6 +44,16 @@ async def init_db() -> None:
                 manga_title TEXT NOT NULL,
                 UNIQUE(user_id, manga_url)
             );
+
+            CREATE TABLE IF NOT EXISTS news_channels (
+                guild_id   INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS seen_tweets (
+                tweet_id TEXT PRIMARY KEY,
+                seen_at  TEXT DEFAULT (datetime('now'))
+            );
             """
         )
         await db.commit()
@@ -219,3 +229,36 @@ async def get_all_dm_subscriptions() -> list[tuple[int, str]]:
             "SELECT DISTINCT user_id, manga_url FROM user_dm_subscriptions"
         ) as cur:
             return await cur.fetchall()
+
+
+# ── News (anime X/Twitter feed) ───────────────────────────────────────────────
+
+async def set_news_channel(guild_id: int, channel_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO news_channels (guild_id, channel_id) VALUES (?,?)",
+            (guild_id, channel_id),
+        )
+        await db.commit()
+
+
+async def get_all_news_channels() -> list[tuple[int, int]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT guild_id, channel_id FROM news_channels") as cur:
+            return await cur.fetchall()
+
+
+async def is_tweet_seen(tweet_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM seen_tweets WHERE tweet_id = ?", (tweet_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def mark_tweet_seen(tweet_id: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO seen_tweets (tweet_id) VALUES (?)", (tweet_id,)
+        )
+        await db.commit()

@@ -12,11 +12,13 @@ from discord import app_commands
 from discord.ext import tasks
 
 from . import database as db
+from .news import Tweet, fetch_latest_tweets, get_cached_tweets
 from .scraper import Chapter, fetch_latest_chapters, fetch_manga_chapters, fetch_series_type, search_manga
 
 log = logging.getLogger(__name__)
 
-POLL_INTERVAL_MINUTES = 5
+POLL_INTERVAL_MINUTES      = 5
+NEWS_POLL_INTERVAL_MINUTES = 30
 SITE_NAME  = "مانجا ستارز"
 SITE_URL   = "https://manga-starz.net"
 EMBED_COLOR = 0x1B6CA8
@@ -64,6 +66,7 @@ class MangaBot(discord.Client):
         _register_commands(self.tree, self)
         await self.tree.sync()
         self.poll_loop.start()
+        self.news_loop.start()
         log.info("Bot ready. Polling every %d minutes.", POLL_INTERVAL_MINUTES)
 
     async def on_ready(self) -> None:
@@ -79,12 +82,23 @@ class MangaBot(discord.Client):
                 guild_name = guild.name
                 break
         sub_count = await db.get_dm_user_count()
-        await self.change_presence(
-            status=discord.Status.idle,
-            activity=discord.CustomActivity(
-                name=f"👥 {sub_count} مشترك",
-            ),
+
+        watching = discord.Activity(
+            type=discord.ActivityType.watching,
+            name=guild_name or "manga-starz.net",
         )
+        custom = discord.CustomActivity(name=f"{sub_count} subscribers")
+
+        payload = {
+            "op": self.ws.PRESENCE,
+            "d": {
+                "activities": [watching.to_dict(), custom.to_dict()],
+                "afk": False,
+                "since": 0,
+                "status": "idle",
+            },
+        }
+        await self.ws.send(discord.utils._to_json(payload))
 
     @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
     async def poll_loop(self) -> None:
@@ -94,6 +108,45 @@ class MangaBot(discord.Client):
     async def before_poll(self) -> None:
         await self.wait_until_ready()
         await asyncio.sleep(5)
+
+    @tasks.loop(minutes=NEWS_POLL_INTERVAL_MINUTES)
+    async def news_loop(self) -> None:
+        await self._check_for_new_tweets()
+
+    @news_loop.before_loop
+    async def before_news_loop(self) -> None:
+        await self.wait_until_ready()
+        await asyncio.sleep(15)
+
+    async def _check_for_new_tweets(self) -> None:
+        log.info("Checking for new tweets from @CrunchyrollMENA…")
+        news_channels = await db.get_all_news_channels()
+        if not news_channels:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            tweets: list[Tweet] = await loop.run_in_executor(None, fetch_latest_tweets, 20)
+        except Exception as e:
+            log.error("News fetch error: %s", e)
+            return
+
+        new_count = 0
+        for tweet in reversed(tweets):
+            if await db.is_tweet_seen(tweet.tweet_id):
+                continue
+            await db.mark_tweet_seen(tweet.tweet_id)
+            new_count += 1
+            embeds = _build_tweet_embeds(tweet)
+            for guild_id, channel_id in news_channels:
+                channel = self.get_channel(channel_id)
+                if channel and isinstance(channel, discord.TextChannel):
+                    try:
+                        await channel.send(embeds=embeds)
+                    except discord.Forbidden:
+                        log.warning("No permission in news channel %d", channel_id)
+                    except Exception as e:
+                        log.error("News send failed: %s", e)
+        log.info("News check done. %d new tweet(s).", new_count)
 
     async def _get_series_type(self, manga_title: str, manga_url: str) -> str:
         cache_key = manga_url or manga_title
@@ -157,6 +210,41 @@ class MangaBot(discord.Client):
                     log.error("DM failed for user %d: %s", user_id, e)
 
         log.info("Done. %d new chapter(s) found.", new_count)
+
+
+NEWS_COLOR = 0x1DA1F2  # Twitter/X blue
+
+
+def _build_tweet_embeds(tweet: Tweet) -> list[discord.Embed]:
+    """Build up to 4 embeds for a tweet (text + images). Discord allows max 10 embeds per message."""
+    main = discord.Embed(
+        description=tweet.text,
+        url=tweet.url,
+        color=NEWS_COLOR,
+    )
+    main.set_author(
+        name="🎌 Crunchyroll MENA — أخبار الأنمي",
+        url=f"https://x.com/CrunchyrollMENA",
+        icon_url="https://pbs.twimg.com/profile_images/1589121816956817408/iMkllRLJ_400x400.jpg",
+    )
+    main.set_footer(text="X (Twitter) • @CrunchyrollMENA", icon_url="https://abs.twimg.com/favicons/twitter.3.ico")
+    if tweet.timestamp:
+        try:
+            from email.utils import parsedate_to_datetime
+            main.timestamp = parsedate_to_datetime(tweet.timestamp)
+        except Exception:
+            pass
+
+    embeds: list[discord.Embed] = [main]
+
+    if tweet.images:
+        main.set_image(url=tweet.images[0])
+        for img_url in tweet.images[1:4]:
+            extra = discord.Embed(url=tweet.url, color=NEWS_COLOR)
+            extra.set_image(url=img_url)
+            embeds.append(extra)
+
+    return embeds
 
 
 def _build_chapter_embed(ch: Chapter, series_type: str = "") -> discord.Embed:
@@ -311,6 +399,43 @@ class SearchConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
 
 
+class SearchResultSelect(discord.ui.Select):
+    def __init__(self, results: list[dict]) -> None:
+        options = [
+            discord.SelectOption(
+                label=r["title"][:100],
+                value=str(i),
+                description=r["url"][:100] if r.get("url") else None,
+            )
+            for i, r in enumerate(results[:25])
+        ]
+        super().__init__(
+            placeholder="اختر العنوان الصحيح…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.results = results
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        idx = int(self.values[0])
+        result = self.results[idx]
+        await interaction.response.edit_message(
+            content="⏳ جاري جلب الفصول…", embed=None, view=None
+        )
+        await _load_and_show_chapters(interaction, result)
+
+
+class SearchResultsView(discord.ui.View):
+    def __init__(self, results: list[dict]) -> None:
+        super().__init__(timeout=60)
+        self.add_item(SearchResultSelect(results))
+
+    @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="تم الإلغاء.", embed=None, view=None)
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
@@ -411,15 +536,26 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 f"❌ لم أجد **{الاسم}** في مانجا ستارز.", ephemeral=True
             )
             return
-        best = results[0]
-        embed = discord.Embed(
-            title="🔍 هل تقصد هذا؟",
-            description=f"**[{best['title']}]({best['url']})**",
-            color=EMBED_COLOR,
-        )
-        embed.set_footer(text=SITE_NAME)
-        view = SearchConfirmView(best)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        if len(results) == 1:
+            best = results[0]
+            embed = discord.Embed(
+                title="🔍 هل تقصد هذا؟",
+                description=f"**[{best['title']}]({best['url']})**",
+                color=EMBED_COLOR,
+            )
+            embed.set_footer(text=SITE_NAME)
+            view = SearchConfirmView(best)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        else:
+            shown = min(len(results), 25)
+            embed = discord.Embed(
+                title=f"🔍 نتائج البحث عن: {الاسم}",
+                description=f"وُجد **{shown}** نتيجة — اختر العنوان الصحيح:",
+                color=EMBED_COLOR,
+            )
+            embed.set_footer(text=SITE_NAME)
+            view = SearchResultsView(results)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @tree.command(name="watch", description="تلقي إشعارات بالخاص عند صدور فصل جديد")
     async def watch(interaction: discord.Interaction, الاسم: str) -> None:
@@ -510,6 +646,51 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             )
         embed.set_footer(text=SITE_NAME)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @tree.command(name="setnewschannel", description="[مطور] تعيين قناة أخبار الأنمي من @CrunchyrollMENA")
+    @dev_only()
+    async def setnewschannel(
+        interaction: discord.Interaction,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if not interaction.guild_id:
+            await interaction.response.send_message("❌ يعمل في السيرفر فقط.", ephemeral=True)
+            return
+        target = channel or interaction.channel
+        if not isinstance(target, discord.TextChannel):
+            await interaction.response.send_message("❌ الرجاء تحديد قناة نصية.", ephemeral=True)
+            return
+        await db.set_news_channel(interaction.guild_id, target.id)
+        await interaction.response.send_message(
+            f"✅ أخبار الأنمي ستُرسل إلى {target.mention} (كل {NEWS_POLL_INTERVAL_MINUTES} دقيقة)", ephemeral=True
+        )
+
+    @tree.command(name="checknews", description="[مطور] فحص أخبار الأنمي فوراً")
+    @dev_only()
+    async def checknews(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message("🔍 جاري فحص أخبار الأنمي…", ephemeral=True)
+        await bot._check_for_new_tweets()
+        await interaction.edit_original_response(content="✅ تم الفحص! الأخبار الجديدة ستظهر في القناة المحددة.")
+
+    @tree.command(name="latestnews", description="آخر 5 أخبار أنمي من @CrunchyrollMENA")
+    async def latestnews(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=False)
+        tweets = get_cached_tweets(5)
+        if not tweets:
+            loop = asyncio.get_running_loop()
+            try:
+                tweets = await loop.run_in_executor(None, fetch_latest_tweets, 5)
+            except Exception:
+                pass
+        if not tweets:
+            await interaction.followup.send(
+                "⏳ لم تُجلب الأخبار بعد — حاول بعد قليل أو استخدم `/checknews`.",
+                ephemeral=True,
+            )
+            return
+        for tweet in tweets[:5]:
+            embeds = _build_tweet_embeds(tweet)
+            await interaction.followup.send(embeds=embeds)
 
     @tree.command(name="status", description="حالة البوت واشتراكاتك")
     async def status(interaction: discord.Interaction) -> None:

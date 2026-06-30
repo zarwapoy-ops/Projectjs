@@ -302,6 +302,38 @@ def fetch_manga_chapters(manga_title: str, manga_url: str = "") -> list[dict]:
     return chapters
 
 
+def _query_to_slug(query: str) -> str:
+    """Convert a search query to a URL slug. e.g. 'One Piece' → 'one-piece'"""
+    return re.sub(r"[^a-z0-9]+", "-", query.lower().strip()).strip("-")
+
+
+def _try_direct_url(slug: str, scraper: cloudscraper.CloudScraper) -> dict | None:
+    """
+    Try fetching BASE_URL/manga/{slug}/ directly.
+    If it returns a valid manga page, extract the title and return {title, url}.
+    """
+    url = f"{BASE_URL}/manga/{slug}/"
+    try:
+        resp = scraper.get(url, timeout=20)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title_el = (
+            soup.select_one(".post-title h1")
+            or soup.select_one(".post-title h3")
+            or soup.select_one("h1.entry-title")
+        )
+        if not title_el:
+            return None
+        title = title_el.get_text(strip=True)
+        if title:
+            log.info("[starz-v2] direct URL hit: '%s' → %s", title, url)
+            return {"title": title, "url": url}
+    except Exception as exc:
+        log.debug("[starz-v2] direct URL check failed for slug '%s': %s", slug, exc)
+    return None
+
+
 def search_manga(query: str) -> list[dict]:
     """Search manga-starz.net by title. Returns [{title, url}, ...]."""
     scraper = _make_scraper()
@@ -309,6 +341,8 @@ def search_manga(query: str) -> list[dict]:
         scraper.get(f"{BASE_URL}/", timeout=20)
     except Exception:
         pass
+
+    results: list[dict] = []
 
     try:
         resp = scraper.post(
@@ -326,16 +360,30 @@ def search_manga(query: str) -> list[dict]:
                 if item.get("title") and item.get("url")
             ]
             log.info("[starz-v2] search '%s' → %d results", query, len(results))
-            return results[:10]
     except Exception as exc:
         log.warning("[starz-v2] search AJAX failed: %s — fallback to homepage", exc)
 
+    # Try direct slug URL — catches exact-name titles the API misses (e.g. "one-piece")
+    slug = _query_to_slug(query)
+    direct_url = f"{BASE_URL}/manga/{slug}/"
+    already_in_results = any(
+        r["url"].rstrip("/") == direct_url.rstrip("/") for r in results
+    )
+    if not already_in_results:
+        direct = _try_direct_url(slug, scraper)
+        if direct:
+            results.insert(0, direct)
+
+    if results:
+        return results[:25]
+
+    # Last fallback: scan homepage chapters
     chapters = fetch_latest_chapters()
     q = query.lower()
     seen: set[str] = set()
-    results = []
+    fallback = []
     for ch in chapters:
         if q in ch.manga_title.lower() and ch.manga_url not in seen:
             seen.add(ch.manga_url)
-            results.append({"title": ch.manga_title, "url": ch.manga_url})
-    return results[:10]
+            fallback.append({"title": ch.manga_title, "url": ch.manga_url})
+    return fallback[:25]
