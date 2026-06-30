@@ -50,26 +50,43 @@ def _embed_info(msg: str) -> discord.Embed:
     return discord.Embed(description=msg, color=COLOR_INFO)
 
 
-def _download_cover_sync(url: str) -> Optional[discord.File]:
-    """Download cover using cloudscraper (bypasses Cloudflare). Runs in executor."""
+def _download_cover_bytes(url: str) -> Optional[tuple[bytes, str]]:
+    """Download cover bytes using cloudscraper. Returns (content, ext) or None."""
     try:
         import cloudscraper
         scraper = cloudscraper.create_scraper()
         resp = scraper.get(url, timeout=12, headers={"Referer": "https://manga-starz.net/"})
-        if resp.status_code == 200:
+        if resp.status_code == 200 and resp.content:
             ext = "jpg" if "jpeg" in resp.headers.get("Content-Type", "") or url.lower().endswith(".jpg") else "png"
-            return discord.File(io.BytesIO(resp.content), filename=f"cover.{ext}")
+            log.info("Cover downloaded OK: %d bytes (%s)", len(resp.content), url)
+            return resp.content, ext
+        else:
+            log.warning("Cover HTTP %s for %s", resp.status_code, url)
     except Exception as exc:
         log.warning("Cover download failed for %s: %s", url, exc)
     return None
 
 
-async def _get_cover_file(cover_url: str) -> Optional[discord.File]:
-    """Async wrapper — downloads cover in thread executor."""
+async def _get_cover_bytes(cover_url: str) -> Optional[tuple[bytes, str]]:
+    """Download cover bytes asynchronously. Returns (bytes, ext) or None."""
     if not cover_url:
         return None
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _download_cover_sync, cover_url)
+    return await loop.run_in_executor(None, _download_cover_bytes, cover_url)
+
+
+def _make_cover_file(data: tuple[bytes, str]) -> discord.File:
+    """Create a fresh discord.File from (bytes, ext). Must be called fresh per send."""
+    content, ext = data
+    return discord.File(io.BytesIO(content), filename=f"cover.{ext}")
+
+
+async def _get_cover_file(cover_url: str) -> Optional[discord.File]:
+    """Async wrapper — downloads cover bytes in thread, creates File in async context."""
+    result = await _get_cover_bytes(cover_url)
+    if result is None:
+        return None
+    return _make_cover_file(result)
 
 
 # ── Developer access ──────────────────────────────────────────────────────────
@@ -443,6 +460,14 @@ class GoToChapterModal(discord.ui.Modal, title="اذهب لفصل محدد"):
         query = self.chapter_input.value.strip()
         chapters = self.paginator.chapters
 
+        # Reject pure-text input — must contain at least one digit
+        if not re.search(r'\d', query):
+            await interaction.response.send_message(
+                embed=_embed_error("❌ أدخل رقم الفصل فقط.\nمثال: **50** أو **10.5**"),
+                ephemeral=True,
+            )
+            return
+
         # Extract the numeric part from the query for exact comparison
         query_nums = re.findall(r'\d+(?:\.\d+)?', query)
         query_num = query_nums[0] if query_nums else None
@@ -538,13 +563,13 @@ class ChapterPaginatorView(discord.ui.View):
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.page -= 1
         self._refresh_buttons()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self, attachments=[])
 
     @discord.ui.button(label="التالي ▶", style=discord.ButtonStyle.secondary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.page += 1
         self._refresh_buttons()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self, attachments=[])
 
     @discord.ui.button(label="🔢 اذهب لفصل", style=discord.ButtonStyle.primary, row=0)
     async def goto_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -593,7 +618,7 @@ async def _load_and_show_chapters(
         )
         return
     view = ChapterPaginatorView(result["title"], result.get("url", ""), chapters, bot=bot, result=result)
-    await interaction.edit_original_response(content=None, embed=view.build_embed(), view=view)
+    await interaction.edit_original_response(content=None, embed=view.build_embed(), view=view, attachments=[])
 
 
 async def _do_watch_subscription(
@@ -756,7 +781,7 @@ class SearchResultSelect(discord.ui.Select):
         idx = int(self.values[0])
         result = self.results[idx]
         await interaction.response.edit_message(
-            embed=_embed_info("⏳ جاري جلب الفصول…"), content=None, view=None
+            embed=_embed_info("⏳ جاري جلب الفصول…"), content=None, view=None, attachments=[]
         )
         await _load_and_show_chapters(interaction, result, bot=self.bot)
 
@@ -912,7 +937,9 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         user_id = interaction.user.id
         if len(results) == 1:
             best = results[0]
-            cover_file = await _get_cover_file(best.get("cover", ""))
+            cover_url = best.get("cover", "")
+            cover_file = await _get_cover_file(cover_url)
+            log.info("[search] cover_file=%s cover_url=%s", cover_file is not None, bool(cover_url))
             embed = discord.Embed(
                 title=best["title"],
                 url=best.get("url", SITE_URL),
@@ -923,14 +950,16 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 embed.set_image(url=f"attachment://{cover_file.filename}")
             embed.set_footer(text=f"{SITE_NAME}  •  اضغط زر الفصول أو المتابعة أدناه", icon_url=_FOOTER_ICON)
             view = SearchConfirmView(best, bot, user_id=user_id)
-            kwargs = dict(embed=embed, view=view)
             if cover_file:
-                kwargs["file"] = cover_file
-            await interaction.followup.send(**kwargs)
+                await interaction.edit_original_response(embed=embed, view=view, attachments=[cover_file])
+            else:
+                await interaction.edit_original_response(embed=embed, view=view)
         else:
             shown = min(len(results), 25)
             best = results[0]
-            cover_file = await _get_cover_file(best.get("cover", ""))
+            cover_url = best.get("cover", "")
+            cover_file = await _get_cover_file(cover_url)
+            log.info("[search-multi] cover_file=%s cover_url=%s", cover_file is not None, bool(cover_url))
             list_lines = [
                 f"`{i+1}.` [{r['title']}]({r['url']})" if r.get("url") else f"`{i+1}.` {r['title']}"
                 for i, r in enumerate(results[:shown])
@@ -948,10 +977,10 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 icon_url=_FOOTER_ICON,
             )
             view = SearchResultsView(results, bot=bot, user_id=user_id)
-            kwargs = dict(embed=embed, view=view)
             if cover_file:
-                kwargs["file"] = cover_file
-            await interaction.followup.send(**kwargs)
+                await interaction.edit_original_response(embed=embed, view=view, attachments=[cover_file])
+            else:
+                await interaction.edit_original_response(embed=embed, view=view)
 
     @tree.command(name="watch", description="تلقي إشعارات بالخاص عند صدور فصل جديد")
     async def watch(interaction: discord.Interaction, الاسم: str) -> None:
@@ -967,7 +996,9 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         user_id = interaction.user.id
         if len(results) == 1:
             best = results[0]
-            cover_file = await _get_cover_file(best.get("cover", ""))
+            cover_url = best.get("cover", "")
+            cover_file = await _get_cover_file(cover_url)
+            log.info("[watch] cover_file=%s cover_url=%s", cover_file is not None, bool(cover_url))
             embed = discord.Embed(
                 title=best["title"],
                 url=best.get("url", SITE_URL),
@@ -978,14 +1009,16 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 embed.set_image(url=f"attachment://{cover_file.filename}")
             embed.set_footer(text=SITE_NAME, icon_url=_FOOTER_ICON)
             view = WatchConfirmView(best, bot, user_id=user_id)
-            kwargs = dict(embed=embed, view=view)
             if cover_file:
-                kwargs["file"] = cover_file
-            await interaction.followup.send(**kwargs)
+                await interaction.edit_original_response(embed=embed, view=view, attachments=[cover_file])
+            else:
+                await interaction.edit_original_response(embed=embed, view=view)
         else:
             shown = min(len(results), 25)
             best = results[0]
-            cover_file = await _get_cover_file(best.get("cover", ""))
+            cover_url = best.get("cover", "")
+            cover_file = await _get_cover_file(cover_url)
+            log.info("[watch-multi] cover_file=%s cover_url=%s", cover_file is not None, bool(cover_url))
             embed = discord.Embed(
                 title=f"اشتراك في: {الاسم}",
                 description=f"وُجد **{shown}** نتيجة — اختر العنوان الصحيح لمتابعته:",
@@ -996,10 +1029,10 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 embed.set_thumbnail(url=f"attachment://{cover_file.filename}")
             embed.set_footer(text=SITE_NAME, icon_url=_FOOTER_ICON)
             view = WatchResultsView(results, bot, user_id=user_id)
-            kwargs = dict(embed=embed, view=view)
             if cover_file:
-                kwargs["file"] = cover_file
-            await interaction.followup.send(**kwargs)
+                await interaction.edit_original_response(embed=embed, view=view, attachments=[cover_file])
+            else:
+                await interaction.edit_original_response(embed=embed, view=view)
 
     @tree.command(name="unwatch", description="إيقاف إشعارات الخاص لمانغا/مانهوا معينة")
     async def unwatch(interaction: discord.Interaction, الاسم: str) -> None:
@@ -1072,10 +1105,16 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             timestamp=discord.utils.utcnow(),
         )
         embed.set_author(name="📋 مانجا ستارز")
+        cover_file = None
         if unique and unique[0].cover_url:
-            embed.set_thumbnail(url=unique[0].cover_url)
+            cover_file = await _get_cover_file(unique[0].cover_url)
+            if cover_file:
+                embed.set_thumbnail(url="attachment://cover.jpg")
         embed.set_footer(text=f"{SITE_NAME}  •  آخر {len(unique)} فصل", icon_url=_FOOTER_ICON)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        if cover_file:
+            await interaction.followup.send(embed=embed, file=cover_file, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
     @tree.command(name="setnewschannel", description="[مطور] تعيين قناة أخبار الأنمي من @CrunchyrollMENA")
     @dev_only()
