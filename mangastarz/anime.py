@@ -66,9 +66,11 @@ def fetch_airing_week() -> list[AiringEpisode]:
 
 
 def _fetch_range(from_ts: int, to_ts: int) -> list[AiringEpisode]:
+    import time as _time
     episodes: list[AiringEpisode] = []
     page = 1
-    while True:
+    MAX_PAGES = 10  # safety cap to avoid infinite loops
+    while page <= MAX_PAGES:
         try:
             resp = requests.post(
                 ANILIST_URL,
@@ -78,6 +80,12 @@ def _fetch_range(from_ts: int, to_ts: int) -> list[AiringEpisode]:
                 },
                 timeout=15,
             )
+            # Respect AniList rate limit (90 req/min)
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 60))
+                log.warning("[anime] rate-limited, sleeping %ds", retry_after)
+                _time.sleep(min(retry_after, 60))
+                continue
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
@@ -101,6 +109,7 @@ def _fetch_range(from_ts: int, to_ts: int) -> list[AiringEpisode]:
         if not page_data.get("pageInfo", {}).get("hasNextPage"):
             break
         page += 1
+        _time.sleep(0.5)  # polite delay between pages
 
     log.info("[anime] %d episodes fetched (%d→%d)", len(episodes), from_ts, to_ts)
     return episodes

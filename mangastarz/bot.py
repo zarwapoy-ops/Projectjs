@@ -34,6 +34,16 @@ COLOR_WARN    = 0xFEE75C
 COLOR_INFO    = 0x3B82F6
 
 
+def _fmt_ch_num(raw: str) -> str:
+    """Return a clean label like 'الفصل 42' or 'الفصل 42.5' from any raw text."""
+    import re
+    m = re.search(r'(\d+(?:[.,]\d+)?)', raw.strip())
+    if m:
+        num = m.group(1).replace(",", ".")
+        return f"الفصل {num}"
+    return raw.strip()
+
+
 def _embed_success(msg: str) -> discord.Embed:
     return discord.Embed(description=msg, color=COLOR_SUCCESS)
 
@@ -57,7 +67,8 @@ def _download_cover_bytes(url: str) -> Optional[tuple[bytes, str]]:
         scraper = cloudscraper.create_scraper()
         resp = scraper.get(url, timeout=12, headers={"Referer": "https://manga-starz.net/"})
         if resp.status_code == 200 and resp.content:
-            ext = "jpg" if "jpeg" in resp.headers.get("Content-Type", "") or url.lower().endswith(".jpg") else "png"
+            ct = resp.headers.get("Content-Type", "").lower()
+            ext = "jpg" if ("jpeg" in ct or "jpg" in ct or url.lower().endswith(".jpg") or url.lower().endswith(".jpeg")) else "png"
             log.info("Cover downloaded OK: %d bytes (%s)", len(resp.content), url)
             return resp.content, ext
         else:
@@ -147,6 +158,7 @@ class MangaBot(discord.Client):
         self.poll_loop.start()
         self.news_loop.start()
         self.anime_loop.start()
+        self.maintenance_loop.start()
         log.info("Bot ready. Polling every %d minutes.", POLL_INTERVAL_MINUTES)
 
     async def on_ready(self) -> None:
@@ -217,6 +229,22 @@ class MangaBot(discord.Client):
     async def before_anime_loop(self) -> None:
         await self.wait_until_ready()
         await asyncio.sleep(20)
+
+    @tasks.loop(hours=24)
+    async def maintenance_loop(self) -> None:
+        """Daily cleanup: purge old seen records and export backup."""
+        try:
+            await db.purge_old_seen_chapters(keep_days=90)
+            await db.purge_old_seen_tweets(keep_days=30)
+            await db.purge_old_seen_episodes(keep_days=30)
+            await db.export_to_json()
+            log.info("[maintenance] Daily cleanup done.")
+        except Exception as exc:
+            log.error("[maintenance] Error during daily cleanup: %s", exc)
+
+    @maintenance_loop.before_loop
+    async def before_maintenance_loop(self) -> None:
+        await self.wait_until_ready()
 
     async def _check_for_new_episodes(self) -> None:
         channels = await db.get_all_anime_notify_channels()
@@ -299,6 +327,12 @@ class MangaBot(discord.Client):
 
         guild_channels = await db.get_all_guild_channels()
 
+        # Preload all guild subscriptions once — avoids N×M DB hits inside the loop
+        guild_subs: dict[int, set[str]] = {}
+        for guild_id, _ in guild_channels:
+            subs = await db.get_subscriptions(guild_id)
+            guild_subs[guild_id] = {s["url"] for s in subs}
+
         new_count = 0
         for ch in chapters:
             if not ch.chapter_url:
@@ -313,9 +347,9 @@ class MangaBot(discord.Client):
             embed = _build_chapter_embed(ch, series_type)
 
             for guild_id, channel_id in guild_channels:
-                subs = await db.get_subscriptions(guild_id)
-                if subs:
-                    subscribed_urls = {s["url"] for s in subs}
+                subscribed_urls = guild_subs.get(guild_id, set())
+                # If the guild has specific subscriptions, filter by them
+                if subscribed_urls:
                     if not ch.manga_url or ch.manga_url not in subscribed_urls:
                         continue
 
@@ -328,16 +362,18 @@ class MangaBot(discord.Client):
                     except Exception as e:
                         log.error("Send failed: %s", e)
 
-            dm_user_ids = await db.get_users_subscribed_to_dm(ch.manga_url)
-            for user_id in dm_user_ids:
-                try:
-                    user = await self.fetch_user(user_id)
-                    await user.send(embed=embed)
-                    log.info("DM sent to user %d for '%s'", user_id, ch.manga_title)
-                except discord.Forbidden:
-                    log.warning("Cannot DM user %d (DMs closed)", user_id)
-                except Exception as e:
-                    log.error("DM failed for user %d: %s", user_id, e)
+            # Only send DMs if the manga has a valid URL
+            if ch.manga_url:
+                dm_user_ids = await db.get_users_subscribed_to_dm(ch.manga_url)
+                for user_id in dm_user_ids:
+                    try:
+                        user = await self.fetch_user(user_id)
+                        await user.send(embed=embed)
+                        log.info("DM sent to user %d for '%s'", user_id, ch.manga_title)
+                    except discord.Forbidden:
+                        log.warning("Cannot DM user %d (DMs closed)", user_id)
+                    except Exception as e:
+                        log.error("DM failed for user %d: %s", user_id, e)
 
         log.info("Done. %d new chapter(s) found.", new_count)
 
@@ -531,7 +567,7 @@ class ChapterPaginatorView(discord.ui.View):
         start = self.page * CHAPTERS_PER_PAGE
         end = start + CHAPTERS_PER_PAGE
         slice_ = self.chapters[start:end]
-        lines = [f"[{ch['num']}]({ch['url']})" for ch in slice_]
+        lines = [f"[{_fmt_ch_num(ch['num'])}]({ch['url']})" for ch in slice_]
 
         first_ch = self.chapters[-1]
         latest_ch = self.chapters[0]
@@ -545,12 +581,12 @@ class ChapterPaginatorView(discord.ui.View):
         embed.set_author(name="📚 قائمة الفصول")
         embed.add_field(
             name="🔰 أول فصل",
-            value=f"[{first_ch['num']}]({first_ch['url']})",
+            value=f"[{_fmt_ch_num(first_ch['num'])}]({first_ch['url']})",
             inline=True,
         )
         embed.add_field(
             name="🆕 آخر فصل",
-            value=f"[{latest_ch['num']}]({latest_ch['url']})",
+            value=f"[{_fmt_ch_num(latest_ch['num'])}]({latest_ch['url']})",
             inline=True,
         )
         embed.set_footer(
@@ -668,7 +704,10 @@ class WatchConfirmView(discord.ui.View):
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check(interaction): return
-        await interaction.message.delete()
+        try:
+            await interaction.message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            await interaction.response.edit_message(content=None, embed=None, view=None, attachments=[])
 
 
 class WatchResultSelect(discord.ui.Select):
@@ -714,7 +753,10 @@ class WatchResultsView(discord.ui.View):
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check(interaction): return
-        await interaction.message.delete()
+        try:
+            await interaction.message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            await interaction.response.edit_message(content=None, embed=None, view=None, attachments=[])
 
 
 class SearchConfirmView(discord.ui.View):
@@ -749,7 +791,10 @@ class SearchConfirmView(discord.ui.View):
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check(interaction): return
-        await interaction.message.delete()
+        try:
+            await interaction.message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            await interaction.response.edit_message(content=None, embed=None, view=None, attachments=[])
 
 
 def _slug_label(url: str) -> str:
@@ -803,7 +848,10 @@ class SearchResultsView(discord.ui.View):
     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check(interaction): return
-        await interaction.message.delete()
+        try:
+            await interaction.message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            await interaction.response.edit_message(content=None, embed=None, view=None, attachments=[])
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -1109,7 +1157,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         if unique and unique[0].cover_url:
             cover_file = await _get_cover_file(unique[0].cover_url)
             if cover_file:
-                embed.set_thumbnail(url="attachment://cover.jpg")
+                embed.set_thumbnail(url=f"attachment://{cover_file.filename}")
         embed.set_footer(text=f"{SITE_NAME}  •  آخر {len(unique)} فصل", icon_url=_FOOTER_ICON)
         if cover_file:
             await interaction.followup.send(embed=embed, file=cover_file, ephemeral=True)
