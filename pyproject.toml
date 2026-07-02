@@ -12,4 +12,5 @@ dependencies = [
     "feedparser>=6.0.12",
     "requests>=2.34.2",
     "tweety-ns>=2.4.1",
+    "yt-dlp>=2026.6.9",
 ]
