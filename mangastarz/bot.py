@@ -18,7 +18,8 @@ from . import database as db
 from .anime import AiringEpisode, fetch_airing_today, fetch_airing_week
 from .news import Tweet, fetch_latest_tweets, get_cached_tweets
 from .scraper import Chapter, fetch_latest_chapters, fetch_manga_chapters, fetch_series_type, search_manga
-from .anidl import AnimeResult, TorrentResult, download_torrent_bytes, search_anime, search_torrents
+from .anidl import AnimeResult, TorrentResult, download_torrent_bytes, search_anime, search_episode_youtube, search_torrents
+from .animeslayer import AnimeSlayerEpisode, find_episode_slayer, get_stream_url_slayer
 
 log = logging.getLogger(__name__)
 
@@ -1328,6 +1329,67 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
 
     # ── Anime search + torrent commands ───────────────────────────────────────
 
+    class SlayerEpisodeView(discord.ui.View):
+        """View shown with an Anime Slayer episode embed — adds a download button."""
+
+        def __init__(self, watch_url: str) -> None:
+            super().__init__(timeout=300)
+            self.watch_url = watch_url
+
+        @discord.ui.button(label="⬇️ روابط التحميل", style=discord.ButtonStyle.primary)
+        async def download_btn(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ) -> None:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            loop = asyncio.get_running_loop()
+
+            urls: dict[str, str] = await loop.run_in_executor(
+                None, get_stream_url_slayer, self.watch_url
+            )
+
+            if not urls:
+                await interaction.followup.send(
+                    embed=_embed_error(
+                        "❌ تعذّر استخراج روابط التحميل.\n"
+                        "💡 جرّب مباشرةً من موقع [Anime Slayer]"
+                        f"({self.watch_url})"
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            # Build quality-sorted embed
+            quality_order = ["1080p", "720p", "480p", "360p", "default"]
+            embed = discord.Embed(
+                title="روابط التحميل المباشر",
+                color=ANIME_COLOR,
+            )
+            embed.set_author(name="⬇️ Anime Slayer — دبلجة عربية")
+
+            added = 0
+            for q in quality_order:
+                if q in urls:
+                    label = q if q != "default" else "مباشر"
+                    embed.add_field(
+                        name=f"📥 {label}",
+                        value=f"[تحميل]({urls[q]})",
+                        inline=True,
+                    )
+                    added += 1
+
+            # Any remaining qualities not in the preset order
+            for q, url in urls.items():
+                if q not in quality_order:
+                    embed.add_field(
+                        name=f"📥 {q}",
+                        value=f"[تحميل]({url})",
+                        inline=True,
+                    )
+                    added += 1
+
+            embed.set_footer(text="الروابط مؤقتة — حمّل فوراً")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
     class EpisodeModal(discord.ui.Modal, title="اختر رقم الحلقة"):
         episode_input = discord.ui.TextInput(
             label="رقم الحلقة",
@@ -1361,7 +1423,28 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             await interaction.response.defer(ephemeral=True)
             loop = asyncio.get_running_loop()
 
-            # Search YouTube for a watchable episode link
+            # 1️⃣ Try Anime Slayer first (Arabic dubbed source)
+            slayer_ep: AnimeSlayerEpisode | None = await loop.run_in_executor(
+                None, find_episode_slayer, anime.title, ep_num
+            )
+
+            if slayer_ep:
+                embed = discord.Embed(
+                    title=f"{anime.title} — حلقة {ep_num}",
+                    url=slayer_ep.watch_url,
+                    description=f"**{slayer_ep.title}**" if slayer_ep.title else "",
+                    color=ANIME_COLOR,
+                )
+                embed.set_author(name="🎌 Anime Slayer — دبلجة عربية")
+                if slayer_ep.thumb:
+                    embed.set_thumbnail(url=slayer_ep.thumb)
+                embed.add_field(name="شاهد الآن", value=f"[اضغط هنا ◀]({slayer_ep.watch_url})", inline=False)
+                embed.set_footer(text="animeslayer.to")
+                view = SlayerEpisodeView(slayer_ep.watch_url)
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+                return
+
+            # 2️⃣ Fallback: YouTube search
             yt_results = await loop.run_in_executor(
                 None, search_episode_youtube, anime.title, ep_num
             )
@@ -1369,7 +1452,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             if not yt_results:
                 await interaction.followup.send(
                     embed=_embed_error(
-                        f"❌ لم يُعثر على الحلقة **{ep_num}** من **{anime.title}** في YouTube.\n"
+                        f"❌ لم يُعثر على الحلقة **{ep_num}** من **{anime.title}**.\n"
                         "💡 جرّب اسم الأنمي بالإنجليزي."
                     ),
                     ephemeral=True,
@@ -1380,13 +1463,10 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             mins = best["duration"] // 60
             quality_tag = "🟢 حلقة كاملة" if best["is_full"] else f"🟡 {mins} دقيقة"
 
-            # Build header text
             lines = [
                 f"**{anime.title} — حلقة {ep_num}**",
                 f"`{quality_tag}` • {best['channel'][:40]}",
             ]
-
-            # Add alternative links if any
             alts = [
                 f"{'🟢' if v['is_full'] else '🟡'} {v['url']}"
                 for v in yt_results[1:3]
@@ -1394,7 +1474,6 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             if alts:
                 lines.append("بدائل: " + "  ".join(alts))
 
-            # Send YouTube URL as plain text — Discord auto-embeds it as a playable video
             await interaction.followup.send(
                 content="\n".join(lines) + "\n" + best["url"],
                 ephemeral=True,

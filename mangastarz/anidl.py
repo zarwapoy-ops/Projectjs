@@ -152,6 +152,60 @@ def search_torrents(
     return items[:5]
 
 
+def search_episode_youtube(
+    anime_title: str,
+    ep_num: int,
+    max_results: int = 3,
+) -> list[dict]:
+    """Search YouTube for an anime episode using yt-dlp.
+
+    Returns a list of dicts with keys: url, duration (seconds), channel, is_full.
+    An episode is considered "full" if its duration is >= 20 minutes.
+    """
+    import yt_dlp  # already a project dependency
+
+    query = f"{anime_title} episode {ep_num}"
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "default_search": f"ytsearch{max_results + 2}",
+        "noplaylist": True,
+        "socket_timeout": 15,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{max_results + 2}:{query}", download=False)
+            entries = (info or {}).get("entries") or []
+    except Exception as exc:
+        log.warning("[anidl] YouTube search failed: %s", exc)
+        return []
+
+    results: list[dict] = []
+    for entry in entries:
+        if not entry:
+            continue
+        vid_id = entry.get("id") or entry.get("webpage_url_basename")
+        if not vid_id:
+            continue
+        try:
+            duration = int(entry.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        results.append(
+            {
+                "url": f"https://www.youtube.com/watch?v={vid_id}",
+                "duration": duration,
+                "channel": (entry.get("channel") or entry.get("uploader") or "?")[:60],
+                "is_full": duration >= 20 * 60,
+            }
+        )
+        if len(results) >= max_results:
+            break
+
+    return results
+
+
 def download_torrent_bytes(torrent_link: str) -> Optional[bytes]:
     """
     Download the .torrent file from nyaa.si and return raw bytes.
