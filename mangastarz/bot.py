@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
 import time
 from typing import Optional
 
@@ -1377,15 +1380,8 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                     )
                     added += 1
 
-            # Any remaining qualities not in the preset order
-            for q, url in urls.items():
-                if q not in quality_order:
-                    embed.add_field(
-                        name=f"📥 {q}",
-                        value=f"[تحميل]({url})",
-                        inline=True,
-                    )
-                    added += 1
+            # Ignore any keys outside the known quality labels — unexpected keys
+            # (e.g. from a multi-episode playlist) must not appear as fields.
 
             embed.set_footer(text="الروابط مؤقتة — حمّل فوراً")
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1429,10 +1425,25 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             )
 
             if slayer_ep:
+                if slayer_ep.is_batch:
+                    title_line = f"{anime.title} — حلقات (باك)"
+                    batch_note = (
+                        f"⚠️ لم يُعثر على الحلقة **{ep_num}** منفردةً — "
+                        f"هذا الإدخال يحتوي على **مجموعة حلقات**"
+                        + (f": {slayer_ep.title}" if slayer_ep.title else "")
+                        + "\nيمكنك استخدام `/episode` مع رابط الحلقة المحددة مباشرةً."
+                    )
+                else:
+                    title_line = f"{anime.title} — حلقة {ep_num}"
+                    batch_note = ""
+
                 embed = discord.Embed(
-                    title=f"{anime.title} — حلقة {ep_num}",
+                    title=title_line,
                     url=slayer_ep.watch_url,
-                    description=f"**{slayer_ep.title}**" if slayer_ep.title else "",
+                    description=(
+                        (f"**{slayer_ep.title}**\n\n" if slayer_ep.title and not slayer_ep.is_batch else "")
+                        + batch_note
+                    ) or None,
                     color=ANIME_COLOR,
                 )
                 embed.set_author(name="🎌 Anime Slayer — دبلجة عربية")
@@ -1548,38 +1559,117 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         view = AnimeSearchView(results, interaction.user.id)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-    @tree.command(name="episode", description="استخرج رابط تحميل حلقة من anime3rb.com")
-    @app_commands.describe(الرابط="رابط صفحة الحلقة من anime3rb.com")
+    @tree.command(name="episode", description="استخرج رابط تحميل حلقة من animeslayer.to أو anime3rb.com")
+    @app_commands.describe(الرابط="رابط صفحة الحلقة من animeslayer.to أو anime3rb.com")
     async def episode_dl(interaction: discord.Interaction, الرابط: str) -> None:
-        if "anime3rb.com" not in الرابط:
+        is_slayer   = "animeslayer.to" in الرابط
+        is_anime3rb = "anime3rb.com"   in الرابط
+
+        if not is_slayer and not is_anime3rb:
             await interaction.response.send_message(
-                embed=_embed_error("❌ الرابط يجب أن يكون من موقع **anime3rb.com**"), ephemeral=True
+                embed=_embed_error(
+                    "❌ الرابط يجب أن يكون من:\n"
+                    "• **animeslayer.to** — مثال: `https://animeslayer.to/e/حلقة-123#hash`\n"
+                    "• **anime3rb.com**"
+                ),
+                ephemeral=True,
             )
             return
 
         await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
 
+        # ── Anime Slayer path ────────────────────────────────────────────────
+        if is_slayer:
+            urls: dict[str, str] = await loop.run_in_executor(
+                None, get_stream_url_slayer, الرابط
+            )
+
+            if not urls:
+                await interaction.followup.send(
+                    embed=_embed_error(
+                        "❌ تعذّر استخراج روابط التحميل من Anime Slayer.\n"
+                        "💡 جرّب فتح الرابط مباشرةً من المتصفح."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            quality_order = ["1080p", "720p", "480p", "360p", "default"]
+            embed = discord.Embed(
+                title="روابط التحميل المباشر",
+                url=الرابط,
+                color=ANIME_COLOR,
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_author(name="⬇️ Anime Slayer — دبلجة عربية")
+
+            for q in quality_order:
+                if q in urls:
+                    label = q if q != "default" else "مباشر"
+                    embed.add_field(
+                        name=f"📥 {label}",
+                        value=f"[اضغط للتحميل]({urls[q]})",
+                        inline=True,
+                    )
+
+            embed.set_footer(text="الروابط مؤقتة — حمّل فوراً", icon_url=_FOOTER_ICON)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        # ── anime3rb path (yt-dlp) ───────────────────────────────────────────
         def _extract() -> dict:
+            """
+            Extract info for a single anime3rb episode.
+
+            Root-cause guard against the "all episodes" bug:
+            anime3rb page JS exposes the full series playlist to yt-dlp, so
+            extract_info() can return a playlist wrapper (type='playlist' /
+            'multi_video') with every episode as an entry.  We unwrap the
+            wrapper and take ONLY the first entry — which corresponds to the
+            episode URL the user supplied — rather than letting the caller
+            see hundreds of entries.
+
+            Extra safeguards:
+            • playlist_items='1'  → yt-dlp itself fetches at most 1 entry
+            • noplaylist=True     → prefer single-video interpretation
+            • We never fall back to webpage_url (that's the series page, not a video)
+            """
             import yt_dlp
+
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
                 "noplaylist": True,
+                "playlist_items": "1",   # hard cap: even if playlist, only item 1
                 "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36"
+                    ),
                     "Referer": "https://anime3rb.com/",
                 },
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(الرابط, download=False)
-                return info or {}
+                raw = ydl.extract_info(الرابط, download=False) or {}
 
-        loop = asyncio.get_running_loop()
+            # Unwrap playlist wrappers → land on the actual video dict.
+            # Max depth = 5 to guard against malformed/self-referential output.
+            for _ in range(5):
+                if raw.get("_type") not in ("playlist", "multi_video"):
+                    break
+                entries = [e for e in (raw.get("entries") or []) if e]
+                if not entries:
+                    break
+                raw = entries[0]
+
+            return raw
+
         try:
             info = await asyncio.wait_for(
                 loop.run_in_executor(None, _extract),
-                timeout=30,
+                timeout=40,
             )
         except asyncio.TimeoutError:
             await interaction.followup.send(
@@ -1595,21 +1685,30 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         title = info.get("title") or "حلقة"
         thumb = info.get("thumbnail") or ""
 
-        # Collect available formats sorted by quality
+        # Collect direct video stream formats (mp4 / m3u8 / ts)
+        # Sort: non-audio tracks first, then by height descending.
         formats = info.get("formats") or []
-        # Prefer mp4, sort by height descending
         video_formats = [
             f for f in formats
-            if f.get("vcodec") != "none" and f.get("url") and f.get("ext") in ("mp4", "m3u8", "ts", "")
+            if f.get("vcodec") not in (None, "none")
+            and f.get("url")
+            and (f.get("ext") or "").lower() in ("mp4", "m3u8", "ts", "")
         ]
         video_formats.sort(key=lambda f: (f.get("height") or 0), reverse=True)
 
         if not video_formats:
-            # Try direct URL
-            direct = info.get("url") or info.get("webpage_url") or ""
-            if not direct:
+            # Last resort: a bare direct URL from the info dict.
+            # We deliberately do NOT use info.get("webpage_url") — that is the
+            # HTML page (series or episode page), not a video stream.
+            direct = info.get("url") or ""
+            if not direct or "anime3rb.com" in direct:
+                # "url" points back to the site page → no usable stream found
                 await interaction.followup.send(
-                    embed=_embed_error("❌ لم يُعثر على روابط تحميل. الموقع قد يستخدم حماية خاصة."),
+                    embed=_embed_error(
+                        "❌ لم يُعثر على رابط فيديو مباشر.\n"
+                        "💡 تأكد أن الرابط هو صفحة **حلقة** وليس صفحة **الأنمي** كاملاً.\n"
+                        "مثال صحيح: `https://anime3rb.com/episodes/chainsaw-man-1`"
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -1625,17 +1724,31 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         if thumb:
             embed.set_thumbnail(url=thumb)
 
-        # Show top 3 qualities
-        for fmt in video_formats[:3]:
+        # Show top qualities (deduplicated by height)
+        shown_heights: set = set()
+        shown = 0
+        for fmt in video_formats:
             height = fmt.get("height") or 0
-            ext = fmt.get("ext") or "mp4"
+            if height in shown_heights and height != 0:
+                continue
+            shown_heights.add(height)
+            ext   = (fmt.get("ext") or "mp4").upper()
             label = f"{height}p" if height else "Auto"
-            url = fmt["url"]
+            url   = fmt["url"]
             embed.add_field(
-                name=f"📥 {label} ({ext.upper()})",
+                name=f"📥 {label} ({ext})",
                 value=f"[اضغط للتحميل]({url})" if len(url) <= 512 else "الرابط طويل جداً",
                 inline=False,
             )
+            shown += 1
+            if shown >= 4:
+                break
+
+        if shown == 0:
+            await interaction.followup.send(
+                embed=_embed_error("❌ لم يُعثر على جودات قابلة للتشغيل."), ephemeral=True
+            )
+            return
 
         embed.set_footer(text="The sky  •  الروابط مؤقتة وتنتهي بعد فترة", icon_url=_FOOTER_ICON)
         await interaction.followup.send(embed=embed, ephemeral=True)

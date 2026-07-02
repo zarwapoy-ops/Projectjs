@@ -14,8 +14,9 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import unicodedata
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import cloudscraper
@@ -78,10 +79,68 @@ class AnimeSlayerResult:
 
 @dataclass
 class AnimeSlayerEpisode:
-    number:   int
-    title:    str
-    watch_url: str         # https://animeslayer.to/e/<slug>#<hash>
-    thumb:    str
+    number:    int
+    title:     str
+    watch_url: str          # https://animeslayer.to/e/<slug>#<hash>
+    thumb:     str
+    is_batch:  bool = field(default=False)   # True when this entry covers multiple episodes
+
+
+# ── title / episode helpers ───────────────────────────────────────────────────
+
+def _normalize_title(t: str) -> str:
+    """Lower-case, strip diacritics and non-alphanumeric chars for comparison."""
+    t = unicodedata.normalize("NFKD", t.lower())
+    t = "".join(c for c in t if c.isalnum() or c.isspace())
+    return " ".join(t.split())
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """
+    Very simple word-overlap similarity in [0, 1].
+    Returns 1.0 for identical titles, 0.0 for no shared words.
+    We don't need full fuzzy-matching — just enough to avoid obvious mismatches
+    (e.g. matching 'naruto' when searching for 'one piece').
+    """
+    words_a = set(_normalize_title(a).split())
+    words_b = set(_normalize_title(b).split())
+    if not words_a or not words_b:
+        return 0.0
+    shared = words_a & words_b
+    return len(shared) / max(len(words_a), len(words_b))
+
+
+# Regex to detect batch/range episode titles like "الحلقات 1-13" or "Episodes 01 to 26".
+# Uses an alternation group for the separator so "to" is matched as a token,
+# not as individual characters inside a character class.
+_BATCH_TITLE_RE = re.compile(
+    r"(\d+)\s*(?:-|–|—|to|إلى)\s*(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _is_batch_episode(title: str, ep_num: int) -> bool:  # noqa: ARG001
+    """
+    Return True when the episode entry represents a range of episodes
+    (e.g. title "الحلقات 1-13" or "Episodes 01 to 26") rather than a single episode.
+    """
+    m = _BATCH_TITLE_RE.search(title)
+    if not m:
+        return False
+    lo, hi = int(m.group(1)), int(m.group(2))
+    return hi > lo  # any detected ascending range → batch
+
+
+def _batch_contains(title: str, ep_num: int) -> bool:
+    """
+    Return True when *title* contains a range A-B and ep_num falls within [A, B].
+    Used to surface batch entries as a last resort when the exact episode is missing.
+    """
+    m = _BATCH_TITLE_RE.search(title)
+    if not m:
+        return False
+    lo, hi = int(m.group(1)), int(m.group(2))
+    return hi > lo and lo <= ep_num <= hi
 
 
 # ── stream extraction helpers ────────────────────────────────────────────────
@@ -134,12 +193,112 @@ def _parse_direct_urls(player_page: str) -> dict[str, str]:
     return urls
 
 
+def _parse_server_iframes(player_page: str, base_url: str = BASE_URL) -> list[str]:
+    """
+    Extract alternative *server* iframe URLs from a player page.
+
+    Only matches URLs that are clearly video-server player pages
+    (p_wit.php, p_rift.php, p_sl.php, …) on the same CDN host as the
+    original player URL.  This deliberately excludes episode-navigation
+    links (which contain "watch" / "stream" but point to episode pages on
+    animeslayer.to) to avoid fetching content from the wrong episode.
+
+    Relative URLs are resolved against *base_url*.
+    """
+    # Derive the CDN host from base_url so we only follow same-origin iframes
+    parsed_base = urllib.parse.urlparse(base_url)
+    cdn_host = parsed_base.netloc  # e.g. "www.patrimoines-en-mouvement.org"
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(
+        r'(?:src|data-src|data-url)\s*=\s*["\']([^"\']+)["\']',
+        player_page,
+        re.IGNORECASE,
+    ):
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        url = urllib.parse.urljoin(base_url, raw)
+        parsed = urllib.parse.urlparse(url)
+
+        # Must be on the same CDN host (not animeslayer.to episode pages)
+        if cdn_host and parsed.netloc != cdn_host:
+            continue
+        # Must look like a server-specific player script, not a general page
+        if not re.search(r'p_wit|p_rift|p_sl|/player/', parsed.path, re.IGNORECASE):
+            continue
+        if "vfail" in url.lower():
+            continue
+        if url not in seen:
+            seen.add(url)
+            found.append(url)
+    return found
+
+
 # ── public functions ──────────────────────────────────────────────────────────
+
+# bool values to try for the apiSec call in order.
+# "no" = default/first server; "yes" = alternative server.
+# Numeric strings were removed — the backend may interpret them as episode
+# numbers rather than server selectors, which would return the wrong episode.
+_BOOL_CANDIDATES = ["no", "yes"]
+
+
+def _fetch_player_urls(
+    s: cloudscraper.CloudScraper,
+    player_url: str,
+) -> dict[str, str]:
+    """
+    Fetch *player_url*, extract direct stream URLs.
+    Returns empty dict (and logs) if the URL is a vfail page or yields no URLs.
+    """
+    if "vfail" in player_url.lower():
+        log.info("[animeslayer] skipping vfail player URL: %s", player_url[:120])
+        return {}
+    try:
+        r = s.get(player_url, headers={"Referer": BASE_URL}, timeout=15)
+        r.raise_for_status()
+    except Exception as exc:
+        log.warning("[animeslayer] player fetch failed (%s): %s", player_url[:80], exc)
+        return {}
+
+    urls = _parse_direct_urls(r.text)
+    if urls:
+        log.info("[animeslayer] stream URLs from %s: %s", player_url[:80], list(urls.keys()))
+    else:
+        # No direct URLs — look for nested server iframes and try each one
+        alt_iframes = _parse_server_iframes(r.text, base_url=player_url)
+        if alt_iframes:
+            log.info(
+                "[animeslayer] no direct URLs in player page; trying %d nested iframe(s)",
+                len(alt_iframes),
+            )
+        for iframe_url in alt_iframes:
+            try:
+                ri = s.get(iframe_url, headers={"Referer": player_url}, timeout=15)
+                ri.raise_for_status()
+                urls = _parse_direct_urls(ri.text)
+                if urls:
+                    log.info(
+                        "[animeslayer] stream URLs from nested iframe %s: %s",
+                        iframe_url[:80], list(urls.keys()),
+                    )
+                    break
+            except Exception as exc:
+                log.warning("[animeslayer] iframe fetch failed (%s): %s", iframe_url[:80], exc)
+
+    return urls
+
 
 def get_stream_url_slayer(watch_url: str) -> dict[str, str]:
     """
     Given an Anime Slayer episode watch URL (https://animeslayer.to/e/<slug>#<hash>),
     resolve the direct video stream URLs.
+
+    Tries every known server via the ``bool`` parameter of the apiSec call.
+    Falls back to nested server iframes when the primary player page yields no URLs
+    (e.g. when the server returns a vfail.php page for missing episodes).
 
     Returns a dict keyed by quality label e.g. {"1080p": "https://…mp4", "720p": "…"}.
     Returns empty dict on failure.
@@ -178,39 +337,51 @@ def get_stream_url_slayer(watch_url: str) -> dict[str, str]:
             log.warning("[animeslayer] apiFirst error: %s", j2)
             return {}
 
-        # 4. POST to apiSec → encrypted player URL
-        params = urllib.parse.urlencode({
-            "keyn": j2["d"], "name": san,  "pe": j2["c"], "bool": "no",
-            "id":   j2["a"], "info": j2["b"], "san": san,  "mwsem": mwsem,
-        })
-        r3 = s.post(
-            api_sec,
-            data=params,
-            headers={"Content-Type": "application/x-www-form-urlencoded",
-                     "Referer": BASE_URL},
-            timeout=15,
-        )
-        r3.raise_for_status()
-        j3 = r3.json()
-
-        # 5. Decrypt player URL
-        player_url = _stream_xor(j3.get("data", ""))
-        if not player_url or not player_url.startswith("http"):
-            log.warning("[animeslayer] could not decrypt player URL")
-            return {}
-
-        log.info("[animeslayer] player URL: %s", player_url[:120])
-
-        # 6. Fetch player page and extract direct video URLs
-        r4 = s.get(player_url, headers={"Referer": BASE_URL}, timeout=15)
-        r4.raise_for_status()
-        urls = _parse_direct_urls(r4.text)
-        log.info("[animeslayer] stream URLs found: %s", list(urls.keys()))
-        return urls
-
     except Exception as exc:
-        log.warning("[animeslayer] get_stream_url_slayer failed: %s", exc)
+        log.warning("[animeslayer] get_stream_url_slayer setup failed: %s", exc)
         return {}
+
+    # 4–6. Try each bool candidate until we get real stream URLs
+    required_keys = {"a", "b", "c", "d"}
+    if not required_keys.issubset(j2):
+        log.warning("[animeslayer] apiFirst response missing keys: %s", j2)
+        return {}
+    base_params = {
+        "keyn": j2["d"], "name": san,  "pe": j2["c"],
+        "id":   j2["a"], "info": j2["b"], "san": san, "mwsem": mwsem,
+    }
+
+    for bool_val in _BOOL_CANDIDATES:
+        try:
+            params = urllib.parse.urlencode({**base_params, "bool": bool_val})
+            r3 = s.post(
+                api_sec,
+                data=params,
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "Referer": BASE_URL},
+                timeout=15,
+            )
+            r3.raise_for_status()
+            j3 = r3.json()
+
+            player_url = _stream_xor(j3.get("data", ""))
+            if not player_url or not player_url.startswith("http"):
+                log.info("[animeslayer] bool=%r: could not decrypt player URL, skipping", bool_val)
+                continue
+
+            log.info("[animeslayer] bool=%r → player URL: %s", bool_val, player_url[:120])
+
+            urls = _fetch_player_urls(s, player_url)
+            if urls:
+                return urls
+
+            log.info("[animeslayer] bool=%r yielded no stream URLs, trying next server", bool_val)
+
+        except Exception as exc:
+            log.warning("[animeslayer] bool=%r failed: %s", bool_val, exc)
+
+    log.warning("[animeslayer] all servers exhausted for %s", watch_url)
+    return {}
 
 
 def search_anime_slayer(query: str, limit: int = 8) -> list[AnimeSlayerResult]:
@@ -227,7 +398,8 @@ def search_anime_slayer(query: str, limit: int = 8) -> list[AnimeSlayerResult]:
     results: list[AnimeSlayerResult] = []
     for item in data[:limit]:
         href = item.get("href", "")                         # e.g. /title/naruto-…-cae
-        slug = href.lstrip("/title/").strip("/")
+        # removeprefix strips the exact string "/title/" (not individual chars)
+        slug = href.removeprefix("/title/").strip("/")
         results.append(AnimeSlayerResult(
             title    = item.get("title", ""),
             slug     = slug,
@@ -281,45 +453,128 @@ def get_episodes_slayer(slug: str) -> list[AnimeSlayerEpisode]:
             if decoded_path.startswith("/")
             else decoded_path
         )
+        title_str = tm.group(1) if tm else ""
         episodes.append(AnimeSlayerEpisode(
             number    = int(nm.group(1)),
-            title     = tm.group(1) if tm else "",
+            title     = title_str,
             watch_url = watch_url,
             thumb     = thm.group(1) if thm else "",
+            is_batch  = _is_batch_episode(title_str, int(nm.group(1))),
         ))
 
     log.info("[animeslayer] %d episodes found for slug %r", len(episodes), slug)
     return episodes
 
 
+# Words that flag a candidate as a spin-off / recap / special — we deprioritise
+# these so the main series is preferred when both appear in search results.
+_SPINOFF_TOKENS = frozenset([
+    "recap", "recaps", "ملخص", "ملخصات",
+    "special", "specials", "خاص",
+    "movie", "film", "فيلم",
+    "ova", "ona",
+    "compilation", "تجميعة",
+])
+
+
+def _is_spinoff(title: str) -> bool:
+    """Return True if the candidate title looks like a recap / special / movie."""
+    words = set(_normalize_title(title).split())
+    return bool(words & _SPINOFF_TOKENS)
+
+
 def find_episode_slayer(
     anime_title: str,
     ep_num: int,
+    min_similarity: float = 0.25,
 ) -> Optional[AnimeSlayerEpisode]:
     """
     Search for an anime by title and return the episode matching *ep_num*.
-    Tries up to 5 search results until one has episodes, then looks for ep_num.
+
+    Strategy:
+    1. Search Anime Slayer with the given title (up to 8 candidates).
+    2. Skip candidates whose title has < *min_similarity* word overlap with the
+       query — this avoids returning episodes from completely unrelated anime.
+    3. Among matching candidates, try non-spinoff entries first (exact series),
+       then fall back to spinoffs (recap / special / movie) if nothing else matches.
+    4. Within each tier, prefer single (non-batch) episodes over batch/range entries.
     Returns None if not found.
     """
-    results = search_anime_slayer(anime_title, limit=5)
+    results = search_anime_slayer(anime_title, limit=8)
     if not results:
         log.warning("[animeslayer] no search results for %r", anime_title)
         return None
 
+    # Separate candidates into two tiers: main series vs. spin-offs
+    main_candidates:    list[AnimeSlayerResult] = []
+    spinoff_candidates: list[AnimeSlayerResult] = []
+
     for candidate in results:
-        log.info("[animeslayer] trying %r (slug=%r)", candidate.title, candidate.slug)
-        episodes = get_episodes_slayer(candidate.slug)
-        if not episodes:
-            continue
-
-        for ep in episodes:
-            if ep.number == ep_num:
-                return ep
-
-        log.warning(
-            "[animeslayer] episode %d not in %d eps for %r — trying next",
-            ep_num, len(episodes), candidate.title,
+        sim = _title_similarity(anime_title, candidate.title)
+        log.info(
+            "[animeslayer] candidate %r (slug=%r, sim=%.2f, spinoff=%s)",
+            candidate.title, candidate.slug, sim, _is_spinoff(candidate.title),
         )
+        if sim < min_similarity:
+            log.info(
+                "[animeslayer] skipping %r — similarity %.2f below %.2f",
+                candidate.title, sim, min_similarity,
+            )
+            continue
+        if _is_spinoff(candidate.title):
+            spinoff_candidates.append(candidate)
+        else:
+            main_candidates.append(candidate)
+
+    def _search_in(candidates: list[AnimeSlayerResult]) -> tuple[
+        Optional[AnimeSlayerEpisode], Optional[AnimeSlayerEpisode]
+    ]:
+        """Return (single_ep, batch_ep) found in these candidates."""
+        single: Optional[AnimeSlayerEpisode] = None
+        batch:  Optional[AnimeSlayerEpisode] = None
+        for candidate in candidates:
+            episodes = get_episodes_slayer(candidate.slug)
+            if not episodes:
+                continue
+            for ep in episodes:
+                if ep.number == ep_num and not ep.is_batch:
+                    log.info(
+                        "[animeslayer] ✓ single episode %d in %r",
+                        ep_num, candidate.title,
+                    )
+                    return ep, None   # best possible match — stop immediately
+                if ep.is_batch and batch is None:
+                    covers = (ep.number == ep_num) or _batch_contains(ep.title, ep_num)
+                    if covers:
+                        batch = ep
+                        log.info(
+                            "[animeslayer] batch covers ep %d in %r — keeping as fallback",
+                            ep_num, candidate.title,
+                        )
+            log.info(
+                "[animeslayer] episode %d not in %d eps for %r",
+                ep_num, len(episodes), candidate.title,
+            )
+        return single, batch
+
+    # Tier 1: main series candidates
+    single, batch = _search_in(main_candidates)
+    if single:
+        return single          # exact single match in main series — best result
+
+    # Main-tier batch takes precedence over ANY spinoff result
+    if batch:
+        log.warning("[animeslayer] returning main-series batch ep %d as fallback", ep_num)
+        return batch
+
+    # Tier 2: spin-off candidates (recap, special, …) — only if main tier empty
+    so_single, so_batch = _search_in(spinoff_candidates)
+    if so_single:
+        log.warning("[animeslayer] returning spinoff single ep %d as last resort", ep_num)
+        return so_single
+    if so_batch:
+        log.warning("[animeslayer] returning spinoff batch ep %d as last resort", ep_num)
+        return so_batch
 
     log.warning("[animeslayer] episode %d not found for %r", ep_num, anime_title)
     return None
