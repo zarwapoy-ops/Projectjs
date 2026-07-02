@@ -22,7 +22,15 @@ from .anime import AiringEpisode, fetch_airing_today, fetch_airing_week
 from .news import Tweet, fetch_latest_tweets, get_cached_tweets
 from .scraper import Chapter, fetch_latest_chapters, fetch_manga_chapters, fetch_series_type, search_manga
 from .anidl import AnimeResult, TorrentResult, download_torrent_bytes, search_anime, search_episode_youtube, search_torrents
-from .animeslayer import AnimeSlayerEpisode, find_episode_slayer, get_stream_url_slayer
+from .animeslayer import BASE_URL as SLAYER_BASE_URL, AnimeSlayerEpisode, find_episode_slayer, get_stream_url_slayer
+from .videotools import (
+    MAX_COMPRESSIBLE_SECONDS,
+    DownloadBlockedError,
+    cleanup as cleanup_video,
+    compress_to_size,
+    download_source,
+    probe_duration,
+)
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +41,7 @@ ANIME_COLOR = 0xE8410A
 SITE_NAME  = "The sky"
 SITE_URL   = "https://manga-starz.net"
 EMBED_COLOR = 0x1B6CA8
+DISCORD_VIDEO_LIMIT_MB = 10.0
 
 COLOR_SUCCESS = 0x57F287
 COLOR_ERROR   = 0xED4245
@@ -104,6 +113,117 @@ async def _get_cover_file(cover_url: str) -> Optional[discord.File]:
     if result is None:
         return None
     return _make_cover_file(result)
+
+
+async def _send_episode_as_video(
+    interaction: discord.Interaction,
+    stream_url: str,
+    referer: str,
+    title: str,
+    max_size_mb: float = DISCORD_VIDEO_LIMIT_MB,
+) -> None:
+    """Compress *stream_url* to fit Discord's upload limit and send it as an attachment."""
+    loop = asyncio.get_running_loop()
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description=(
+                "🎞️ جاري تحضير الفيديو وضغطه ليصبح أقل من "
+                f"{max_size_mb:.0f} ميغابايت... قد يستغرق هذا بضع دقائق."
+            ),
+            color=ANIME_COLOR,
+        ),
+        ephemeral=True,
+    )
+
+    src_path: Optional[str] = None
+    out_path: Optional[str] = None
+    try:
+        try:
+            src_path = await asyncio.wait_for(
+                loop.run_in_executor(None, download_source, stream_url, referer),
+                timeout=180,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                embed=_embed_error("⏰ انتهى الوقت أثناء تحميل الفيديو من المصدر."), ephemeral=True
+            )
+            return
+        except DownloadBlockedError as exc:
+            await interaction.followup.send(
+                embed=_embed_error(
+                    f"❌ تعذّر تحميل الفيديو من الخادم المصدر.\n{exc}\n"
+                    "💡 جرّب سيرفر/جودة أخرى، أو استخدم `/episode` بدون خيار «ارسال_فيديو» "
+                    "للحصول على روابط تحميل مباشرة بدلاً من ذلك."
+                ),
+                ephemeral=True,
+            )
+            return
+        except Exception:
+            log.exception("[video] failed to download source for %s", title)
+            await interaction.followup.send(
+                embed=_embed_error("❌ تعذّر تحميل الفيديو من الخادم المصدر."), ephemeral=True
+            )
+            return
+
+        duration = await loop.run_in_executor(None, probe_duration, src_path)
+        if not duration:
+            await interaction.followup.send(
+                embed=_embed_error("❌ تعذّر قراءة معلومات الفيديو لضغطه."), ephemeral=True
+            )
+            return
+
+        if duration > MAX_COMPRESSIBLE_SECONDS:
+            minutes = int(duration // 60)
+            cap_minutes = MAX_COMPRESSIBLE_SECONDS // 60
+            await interaction.followup.send(
+                embed=_embed_error(
+                    f"❌ هذا المحتوى طويل جداً (~{minutes} دقيقة) لإرساله كفيديو مضغوط.\n"
+                    f"إرسال الفيديو يدعم فقط حلقات حتى ~{cap_minutes} دقيقة — "
+                    "الأفلام والمحتوى الطويل ستكون جودته غير قابلة للمشاهدة عند ضغطه لهذا الحجم، "
+                    "وقد يستغرق وقتاً طويلاً جداً.\n"
+                    "💡 استخدم `/episode` بدون خيار «ارسال_فيديو» للحصول على روابط تحميل مباشرة بدلاً من ذلك."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        try:
+            out_path = await asyncio.wait_for(
+                loop.run_in_executor(None, compress_to_size, src_path, duration, max_size_mb),
+                timeout=600,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                embed=_embed_error("⏰ انتهى الوقت أثناء ضغط الفيديو."), ephemeral=True
+            )
+            return
+
+        if not out_path:
+            await interaction.followup.send(
+                embed=_embed_error("❌ تعذّر ضغط الفيديو إلى الحجم المطلوب."), ephemeral=True
+            )
+            return
+
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        if size_mb > max_size_mb * 1.05:
+            await interaction.followup.send(
+                embed=_embed_error(
+                    f"⚠️ الحلقة طويلة جداً ولم يمكن ضغطها إلى أقل من {max_size_mb:.0f} ميغابايت "
+                    f"(الحجم النهائي {size_mb:.1f} ميغابايت)."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        safe_name = re.sub(r"[^\w\-. ]", "_", title)[:80] or "episode"
+        await interaction.followup.send(
+            content=f"🎬 **{title}** — ({size_mb:.1f}MB)",
+            file=discord.File(out_path, filename=f"{safe_name}.mp4"),
+            ephemeral=True,
+        )
+    finally:
+        cleanup_video(src_path, out_path)
 
 
 # ── Developer access ──────────────────────────────────────────────────────────
@@ -1560,8 +1680,13 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @tree.command(name="episode", description="استخرج رابط تحميل حلقة من animeslayer.to أو anime3rb.com")
-    @app_commands.describe(الرابط="رابط صفحة الحلقة من animeslayer.to أو anime3rb.com")
-    async def episode_dl(interaction: discord.Interaction, الرابط: str) -> None:
+    @app_commands.describe(
+        الرابط="رابط صفحة الحلقة من animeslayer.to أو anime3rb.com",
+        ارسال_فيديو=f"أرسل الحلقة كملف فيديو مضغوط (حتى {DISCORD_VIDEO_LIMIT_MB:.0f} ميغابايت) بدل الروابط فقط",
+    )
+    async def episode_dl(
+        interaction: discord.Interaction, الرابط: str, ارسال_فيديو: bool = False
+    ) -> None:
         is_slayer   = "animeslayer.to" in الرابط
         is_anime3rb = "anime3rb.com"   in الرابط
 
@@ -1596,6 +1721,29 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 return
 
             quality_order = ["1080p", "720p", "480p", "360p", "default"]
+
+            if ارسال_فيديو:
+                # Pick the smallest available quality — it'll be re-encoded to
+                # a tiny target size anyway, so there's no point downloading
+                # a large master file first.
+                chosen_q, chosen_url = min(
+                    urls.items(),
+                    key=lambda kv: quality_order.index(kv[0]) if kv[0] in quality_order else 99,
+                    default=(None, None),
+                )
+                if not chosen_url:
+                    await interaction.followup.send(
+                        embed=_embed_error("❌ لم يتم العثور على رابط فيديو صالح."), ephemeral=True
+                    )
+                    return
+                await _send_episode_as_video(
+                    interaction,
+                    stream_url=chosen_url,
+                    referer=SLAYER_BASE_URL,
+                    title=الرابط.rsplit("/", 1)[-1] or "حلقة",
+                )
+                return
+
             embed = discord.Embed(
                 title="روابط التحميل المباشر",
                 url=الرابط,
@@ -1713,6 +1861,19 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 )
                 return
             video_formats = [{"url": direct, "height": 0, "ext": "mp4"}]
+
+        if ارسال_فيديو:
+            # Pick the smallest non-zero-height quality (falls back to whatever
+            # is available) — it'll be re-encoded to a tiny target size anyway.
+            non_zero = [f for f in video_formats if (f.get("height") or 0) > 0]
+            chosen = min(non_zero, key=lambda f: f["height"]) if non_zero else video_formats[-1]
+            await _send_episode_as_video(
+                interaction,
+                stream_url=chosen["url"],
+                referer="https://anime3rb.com/",
+                title=title,
+            )
+            return
 
         embed = discord.Embed(
             title=title[:256],
