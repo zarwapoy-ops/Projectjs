@@ -8,6 +8,7 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "beautifulsoup4>=4.15.0",
     "cloudscraper>=1.2.71",
+    "curl-cffi>=0.15.0",
     "discord-py>=2.7.1",
     "feedparser>=6.0.12",
     "requests>=2.34.2",
