@@ -6,6 +6,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -17,6 +18,7 @@ from . import database as db
 from .anime import AiringEpisode, fetch_airing_today, fetch_airing_week
 from .news import Tweet, fetch_latest_tweets, get_cached_tweets
 from .scraper import Chapter, fetch_latest_chapters, fetch_manga_chapters, fetch_series_type, search_manga
+from .anidl import AnimeResult, TorrentResult, download_torrent_bytes, search_anime, search_torrents
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ POLL_INTERVAL_MINUTES      = 5
 NEWS_POLL_INTERVAL_MINUTES = 5
 ANIME_POLL_INTERVAL_MINUTES = 5
 ANIME_COLOR = 0xE8410A
-SITE_NAME  = "مانجا ستارز"
+SITE_NAME  = "The sky"
 SITE_URL   = "https://manga-starz.net"
 EMBED_COLOR = 0x1B6CA8
 
@@ -457,7 +459,7 @@ def _build_tweet_embeds(tweet: Tweet) -> list[discord.Embed]:
 
 def _build_chapter_embed(ch: Chapter, series_type: str = "") -> discord.Embed:
     embed = discord.Embed(
-        title=ch.manga_title,
+        title="The sky",
         url=ch.manga_url or ch.chapter_url or SITE_URL,
         color=EMBED_COLOR,
         timestamp=discord.utils.utcnow(),
@@ -550,9 +552,10 @@ class ChapterPaginatorView(discord.ui.View):
         super().__init__(timeout=180)
         self.title = title
         self.manga_url = manga_url
-        self.chapters = chapters
+        self.chapters = list(reversed(chapters))
         self.bot = bot
         self.result = result
+        self.cover_url: str = (result or {}).get("cover", "")
         self.page = 0
         self.total_pages = max(1, (len(chapters) + CHAPTERS_PER_PAGE - 1) // CHAPTERS_PER_PAGE)
         self._refresh_buttons()
@@ -566,19 +569,42 @@ class ChapterPaginatorView(discord.ui.View):
     def build_embed(self) -> discord.Embed:
         start = self.page * CHAPTERS_PER_PAGE
         end = start + CHAPTERS_PER_PAGE
-        slice_ = self.chapters[start:end]
-        lines = [f"[{_fmt_ch_num(ch['num'])}]({ch['url']})" for ch in slice_]
+        slice_ = list(reversed(self.chapters[start:end]))
 
-        first_ch = self.chapters[-1]
-        latest_ch = self.chapters[0]
+        first_ch = self.chapters[0]
+        latest_ch = self.chapters[-1]
+
+        # Build description line-by-line, never exceeding Discord's 4096-char limit
+        LIMIT = 4096
+        built: list[str] = []
+        total_len = 0
+        hidden = 0
+        for ch in slice_:
+            line = f"[{_fmt_ch_num(ch['num'])}]({ch['url']})"
+            # +1 for the newline separator
+            needed = len(line) + (1 if built else 0)
+            if total_len + needed > LIMIT - 30:  # keep 30 chars for overflow note
+                hidden = len(slice_) - len(built)
+                break
+            built.append(line)
+            total_len += needed
+
+        if not built:
+            description = "لا توجد فصول."
+        elif hidden:
+            description = "\n".join(built) + f"\n… و{hidden} فصل آخر"
+        else:
+            description = "\n".join(built)
 
         embed = discord.Embed(
             title=self.title,
             url=self.manga_url or SITE_URL,
-            description="\n".join(lines) if lines else "لا توجد فصول.",
+            description=description,
             color=EMBED_COLOR,
         )
         embed.set_author(name="📚 قائمة الفصول")
+        if self.cover_url:
+            embed.set_thumbnail(url=self.cover_url)
         embed.add_field(
             name="🔰 أول فصل",
             value=f"[{_fmt_ch_num(first_ch['num'])}]({first_ch['url']})",
@@ -730,6 +756,8 @@ class WatchResultSelect(discord.ui.Select):
         self.bot = bot
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.view._check(interaction):
+            return
         idx = int(self.values[0])
         result = self.results[idx]
         await interaction.response.defer()
@@ -823,6 +851,8 @@ class SearchResultSelect(discord.ui.Select):
         self.bot = bot
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.view._check(interaction):
+            return
         idx = int(self.values[0])
         result = self.results[idx]
         await interaction.response.edit_message(
@@ -1086,7 +1116,10 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
     async def unwatch(interaction: discord.Interaction, الاسم: str) -> None:
         subs = await db.get_dm_subscriptions(interaction.user.id)
         query = الاسم.lower()
-        match = next((s for s in subs if query in s["title"].lower()), None)
+        # exact match first, then partial — avoids removing wrong title
+        match = next((s for s in subs if s["title"].lower() == query), None)
+        if not match:
+            match = next((s for s in subs if query in s["title"].lower()), None)
         if not match:
             await interaction.response.send_message(
                 embed=_embed_error(f"❌ لم أجد **{الاسم}** في قائمة اشتراكاتك."), ephemeral=True
@@ -1291,6 +1324,242 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
         )
         embed.set_footer(text=SITE_NAME, icon_url=_FOOTER_ICON)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+    # ── Anime search + torrent commands ───────────────────────────────────────
+
+    class EpisodeModal(discord.ui.Modal, title="اختر رقم الحلقة"):
+        episode_input = discord.ui.TextInput(
+            label="رقم الحلقة",
+            placeholder="مثال: 1",
+            required=True,
+            max_length=5,
+        )
+
+        def __init__(self, anime: AnimeResult) -> None:
+            super().__init__()
+            self.anime = anime
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            raw = self.episode_input.value.strip()
+            if not raw.isdigit():
+                await interaction.response.send_message(
+                    embed=_embed_error("❌ أدخل رقم صحيح فقط."), ephemeral=True
+                )
+                return
+            ep_num = int(raw)
+            anime  = self.anime
+            if anime.episodes and ep_num > anime.episodes:
+                await interaction.response.send_message(
+                    embed=_embed_error(
+                        f"❌ العدد الكلي للحلقات هو **{anime.episodes}**."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            loop = asyncio.get_running_loop()
+
+            # Search YouTube for a watchable episode link
+            yt_results = await loop.run_in_executor(
+                None, search_episode_youtube, anime.title, ep_num
+            )
+
+            if not yt_results:
+                await interaction.followup.send(
+                    embed=_embed_error(
+                        f"❌ لم يُعثر على الحلقة **{ep_num}** من **{anime.title}** في YouTube.\n"
+                        "💡 جرّب اسم الأنمي بالإنجليزي."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            best = yt_results[0]
+            mins = best["duration"] // 60
+            quality_tag = "🟢 حلقة كاملة" if best["is_full"] else f"🟡 {mins} دقيقة"
+
+            # Build header text
+            lines = [
+                f"**{anime.title} — حلقة {ep_num}**",
+                f"`{quality_tag}` • {best['channel'][:40]}",
+            ]
+
+            # Add alternative links if any
+            alts = [
+                f"{'🟢' if v['is_full'] else '🟡'} {v['url']}"
+                for v in yt_results[1:3]
+            ]
+            if alts:
+                lines.append("بدائل: " + "  ".join(alts))
+
+            # Send YouTube URL as plain text — Discord auto-embeds it as a playable video
+            await interaction.followup.send(
+                content="\n".join(lines) + "\n" + best["url"],
+                ephemeral=True,
+            )
+
+    class AnimeSelectMenu(discord.ui.Select):
+        def __init__(self, results: list[AnimeResult], user_id: int) -> None:
+            options = [
+                discord.SelectOption(
+                    label=a.title[:100],
+                    value=str(i),
+                    description=(
+                        f"{a.format + ' • ' if a.format else ''}"
+                        f"{a.episodes or '?'} حلقة"
+                        + (f" • {a.title_ar[:30]}" if a.title_ar and a.title_ar != a.title else "")
+                    )[:100],
+                )
+                for i, a in enumerate(results[:25])
+            ]
+            super().__init__(
+                placeholder="اختر الأنمي…",
+                min_values=1, max_values=1,
+                options=options,
+            )
+            self.results  = results
+            self.user_id  = user_id
+
+        async def callback(self, interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message(
+                    embed=_embed_error("❌ هذه القائمة ليست لك."), ephemeral=True
+                )
+                return
+            anime = self.results[int(self.values[0])]
+            await interaction.response.send_modal(EpisodeModal(anime))
+
+    class AnimeSearchView(discord.ui.View):
+        def __init__(self, results: list[AnimeResult], user_id: int) -> None:
+            super().__init__(timeout=60)
+            self.add_item(AnimeSelectMenu(results, user_id))
+
+    @tree.command(name="anime", description="ابحث عن أنمي واحصل على رابط تحميل الحلقة")
+    @app_commands.describe(الاسم="اسم الأنمي بالعربي أو الإنجليزي")
+    async def anime_search(interaction: discord.Interaction, الاسم: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
+
+        results: list[AnimeResult] = await loop.run_in_executor(
+            None, search_anime, الاسم
+        )
+
+        if not results:
+            await interaction.followup.send(
+                embed=_embed_error(
+                    f"❌ لا توجد نتائج لـ **{الاسم}**.\n"
+                    "💡 جرّب الكتابة **بالإنجليزي** مثل: `naruto` أو `one piece`"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"نتائج البحث: {الاسم}",
+            description=f"وُجد **{len(results)}** نتيجة — اختر الأنمي ثم أدخل رقم الحلقة:",
+            color=ANIME_COLOR,
+        )
+        embed.set_author(name="🔍 بحث أنمي")
+        if results[0].cover_url:
+            embed.set_thumbnail(url=results[0].cover_url)
+        embed.set_footer(text="The sky  •  AniList", icon_url=_FOOTER_ICON)
+
+        view = AnimeSearchView(results, interaction.user.id)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    @tree.command(name="episode", description="استخرج رابط تحميل حلقة من anime3rb.com")
+    @app_commands.describe(الرابط="رابط صفحة الحلقة من anime3rb.com")
+    async def episode_dl(interaction: discord.Interaction, الرابط: str) -> None:
+        if "anime3rb.com" not in الرابط:
+            await interaction.response.send_message(
+                embed=_embed_error("❌ الرابط يجب أن يكون من موقع **anime3rb.com**"), ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        def _extract() -> dict:
+            import yt_dlp
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "noplaylist": True,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "https://anime3rb.com/",
+                },
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(الرابط, download=False)
+                return info or {}
+
+        loop = asyncio.get_running_loop()
+        try:
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, _extract),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                embed=_embed_error("⏰ انتهى الوقت — الموقع بطيء أو محجوب."), ephemeral=True
+            )
+            return
+        except Exception as exc:
+            await interaction.followup.send(
+                embed=_embed_error(f"❌ تعذّر استخراج الرابط:\n```{str(exc)[:300]}```"), ephemeral=True
+            )
+            return
+
+        title = info.get("title") or "حلقة"
+        thumb = info.get("thumbnail") or ""
+
+        # Collect available formats sorted by quality
+        formats = info.get("formats") or []
+        # Prefer mp4, sort by height descending
+        video_formats = [
+            f for f in formats
+            if f.get("vcodec") != "none" and f.get("url") and f.get("ext") in ("mp4", "m3u8", "ts", "")
+        ]
+        video_formats.sort(key=lambda f: (f.get("height") or 0), reverse=True)
+
+        if not video_formats:
+            # Try direct URL
+            direct = info.get("url") or info.get("webpage_url") or ""
+            if not direct:
+                await interaction.followup.send(
+                    embed=_embed_error("❌ لم يُعثر على روابط تحميل. الموقع قد يستخدم حماية خاصة."),
+                    ephemeral=True,
+                )
+                return
+            video_formats = [{"url": direct, "height": 0, "ext": "mp4"}]
+
+        embed = discord.Embed(
+            title=title[:256],
+            url=الرابط,
+            color=ANIME_COLOR,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_author(name="🎬 روابط التحميل — anime3rb")
+        if thumb:
+            embed.set_thumbnail(url=thumb)
+
+        # Show top 3 qualities
+        for fmt in video_formats[:3]:
+            height = fmt.get("height") or 0
+            ext = fmt.get("ext") or "mp4"
+            label = f"{height}p" if height else "Auto"
+            url = fmt["url"]
+            embed.add_field(
+                name=f"📥 {label} ({ext.upper()})",
+                value=f"[اضغط للتحميل]({url})" if len(url) <= 512 else "الرابط طويل جداً",
+                inline=False,
+            )
+
+        embed.set_footer(text="The sky  •  الروابط مؤقتة وتنتهي بعد فترة", icon_url=_FOOTER_ICON)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
