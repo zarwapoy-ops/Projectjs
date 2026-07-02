@@ -168,9 +168,32 @@ def _parse_direct_urls(player_page: str) -> dict[str, str]:
     """
     Extract quality-keyed direct video URLs from the player page HTML.
     Returns e.g. {"360p": "https://…", "1080p": "https://…"}.
+
+    The video.js-based player pages embed sources as a JS array of objects,
+    e.g. ``{ src: '...mp4', type: 'video/mp4', label: '1080p', res: '1080' }``
+    — but the field order is not guaranteed (some templates put ``label``
+    before ``src``, others after). Scanning each ``{...}`` object as its own
+    unit and searching for ``src``/``label`` independently inside it handles
+    both orderings, unlike a single sequential regex which only matched one
+    direction and silently returned nothing for the other.
     """
     urls: dict[str, str] = {}
-    # Pattern: file: 'https://…video.mp4'  or  file: "https://…"
+    for block in re.findall(r"\{[^{}]*\}", player_page, re.DOTALL):
+        src_m = re.search(
+            r"""src\s*:\s*['"](https?://[^'"]+\.(?:mp4|m3u8)[^'"]*)['"]""",
+            block,
+            re.IGNORECASE,
+        )
+        if not src_m:
+            continue
+        label_m = re.search(r"""label\s*:\s*['"](\d{3,4})p?['"]""", block, re.IGNORECASE)
+        quality = f"{label_m.group(1)}p" if label_m else "default"
+        urls.setdefault(quality, src_m.group(1).rstrip("',"))
+
+    if urls:
+        return urls
+
+    # Fallback for older/simpler pages: quality label then URL on one line.
     for m in re.finditer(
         r'(\d{3,4}p)[^<>]*?["\']?(https?://[^\s"\'<>]+\.(?:mp4|m3u8)[^\s"\'<>]*)',
         player_page,
@@ -180,7 +203,7 @@ def _parse_direct_urls(player_page: str) -> dict[str, str]:
         if quality not in urls:
             urls[quality] = url
 
-    # Fallback: any src: '…mp4/m3u8' without quality label
+    # Last resort: any src: '…mp4/m3u8' without quality label
     if not urls:
         for m in re.finditer(
             r"src\s*:\s*['\"]?(https?://[^\s\"'<>]+\.(?:mp4|m3u8)[^\s\"'<>]*)",
@@ -225,8 +248,14 @@ def _parse_server_iframes(player_page: str, base_url: str = BASE_URL) -> list[st
         # Must be on the same CDN host (not animeslayer.to episode pages)
         if cdn_host and parsed.netloc != cdn_host:
             continue
+        # Skip static JS/CSS bundle assets (video.js library chunks etc.) —
+        # these also live under /lib/player/ and were previously matched as
+        # if they were alternative video servers, wasting the only real
+        # extraction attempt on files that can never contain a stream URL.
+        if parsed.path.lower().endswith((".js", ".mjs", ".css", ".map", ".json")):
+            continue
         # Must look like a server-specific player script, not a general page
-        if not re.search(r'p_wit|p_rift|p_sl|/player/', parsed.path, re.IGNORECASE):
+        if not re.search(r'p_wit|p_rift|p_sl|p_blk|/player/', parsed.path, re.IGNORECASE):
             continue
         if "vfail" in url.lower():
             continue
@@ -351,34 +380,51 @@ def get_stream_url_slayer(watch_url: str) -> dict[str, str]:
         "id":   j2["a"], "info": j2["b"], "san": san, "mwsem": mwsem,
     }
 
+    # The site returns a *different, randomly-picked* player template on
+    # each apiSec call for the same bool value — some templates (p_wit.php)
+    # embed the direct video URL, others (p_blk.php) don't render any usable
+    # source at all (dead end, no matter how many times its own asset files
+    # are re-fetched). Re-POSTing with the same bool value re-rolls which
+    # template comes back, so retrying a couple of times before giving up on
+    # a bool value recovers from an unlucky first draw instead of failing
+    # outright.
+    _ATTEMPTS_PER_BOOL = 3
+
     for bool_val in _BOOL_CANDIDATES:
-        try:
-            params = urllib.parse.urlencode({**base_params, "bool": bool_val})
-            r3 = s.post(
-                api_sec,
-                data=params,
-                headers={"Content-Type": "application/x-www-form-urlencoded",
-                         "Referer": BASE_URL},
-                timeout=15,
-            )
-            r3.raise_for_status()
-            j3 = r3.json()
+        for attempt in range(1, _ATTEMPTS_PER_BOOL + 1):
+            try:
+                params = urllib.parse.urlencode({**base_params, "bool": bool_val})
+                r3 = s.post(
+                    api_sec,
+                    data=params,
+                    headers={"Content-Type": "application/x-www-form-urlencoded",
+                             "Referer": BASE_URL},
+                    timeout=15,
+                )
+                r3.raise_for_status()
+                j3 = r3.json()
 
-            player_url = _stream_xor(j3.get("data", ""))
-            if not player_url or not player_url.startswith("http"):
-                log.info("[animeslayer] bool=%r: could not decrypt player URL, skipping", bool_val)
-                continue
+                player_url = _stream_xor(j3.get("data", ""))
+                if not player_url or not player_url.startswith("http"):
+                    log.info("[animeslayer] bool=%r: could not decrypt player URL, skipping", bool_val)
+                    continue
 
-            log.info("[animeslayer] bool=%r → player URL: %s", bool_val, player_url[:120])
+                log.info(
+                    "[animeslayer] bool=%r attempt %d/%d → player URL: %s",
+                    bool_val, attempt, _ATTEMPTS_PER_BOOL, player_url[:120],
+                )
 
-            urls = _fetch_player_urls(s, player_url)
-            if urls:
-                return urls
+                urls = _fetch_player_urls(s, player_url)
+                if urls:
+                    return urls
 
-            log.info("[animeslayer] bool=%r yielded no stream URLs, trying next server", bool_val)
+                log.info(
+                    "[animeslayer] bool=%r attempt %d/%d yielded no stream URLs, retrying",
+                    bool_val, attempt, _ATTEMPTS_PER_BOOL,
+                )
 
-        except Exception as exc:
-            log.warning("[animeslayer] bool=%r failed: %s", bool_val, exc)
+            except Exception as exc:
+                log.warning("[animeslayer] bool=%r attempt %d/%d failed: %s", bool_val, attempt, _ATTEMPTS_PER_BOOL, exc)
 
     log.warning("[animeslayer] all servers exhausted for %s", watch_url)
     return {}

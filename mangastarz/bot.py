@@ -27,6 +27,7 @@ from .videotools import (
     MAX_COMPRESSIBLE_SECONDS,
     DownloadBlockedError,
     cleanup as cleanup_video,
+    cleanup_stale_temp_files as cleanup_stale_temp_video_files,
     compress_to_size,
     download_source,
     probe_duration,
@@ -115,6 +116,114 @@ async def _get_cover_file(cover_url: str) -> Optional[discord.File]:
     return _make_cover_file(result)
 
 
+def _make_download_progress_cb(
+    loop: asyncio.AbstractEventLoop,
+    message: discord.Message,
+    title: str,
+    min_interval: float = 3.0,
+):
+    """
+    Build a ``progress_cb(downloaded, total)`` for ``download_source`` that
+    edits *message* with a live download percentage.
+
+    ``download_source`` runs in a worker thread (via ``run_in_executor``), so
+    the callback is invoked off the event loop — the Discord API call is
+    scheduled back onto *loop* with ``run_coroutine_threadsafe``. Edits are
+    throttled to ``min_interval`` seconds to stay well under Discord's rate
+    limits regardless of how often the downloader reports progress.
+
+    *message* must be a plain ``discord.Message`` (fetched via the channel,
+    not the interaction webhook) — interaction/webhook tokens expire after
+    ~15 minutes, which is far shorter than long movies can take to
+    download+compress, so editing through the webhook would silently stop
+    working partway through and leave the progress bar frozen.
+    """
+    state = {"last_edit": 0.0}
+
+    def _cb(downloaded: int, total: Optional[int]) -> None:
+        now = time.monotonic()
+        if now - state["last_edit"] < min_interval:
+            return
+        state["last_edit"] = now
+
+        done_mb = downloaded / 1024 / 1024
+        if total:
+            # The source's reported Content-Length is occasionally a hair
+            # smaller than what's actually transferred (server-side
+            # estimate, not a hard byte count). Clamp the *displayed* total
+            # to at least what's been downloaded so the progress bar/labels
+            # never show something confusing like "2099 / 2088 — 101%".
+            display_total = max(total, downloaded)
+            pct = min(downloaded / display_total * 100, 100)
+            bar_len = 20
+            filled = int(bar_len * pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            desc = (
+                f"⬇️ جاري تحميل **{title}**...\n"
+                f"`{bar}` **{pct:.0f}%**\n"
+                f"{done_mb:.0f} / {display_total / 1024 / 1024:.0f} ميغابايت"
+            )
+        else:
+            desc = f"⬇️ جاري تحميل **{title}**... {done_mb:.0f} ميغابايت"
+
+        embed = discord.Embed(description=desc, color=ANIME_COLOR)
+        coro = message.edit(embed=embed)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            log.debug("[video] progress edit scheduling failed", exc_info=True)
+
+    return _cb
+
+
+def _make_compress_progress_cb(
+    loop: asyncio.AbstractEventLoop,
+    message: discord.Message,
+    title: str,
+    max_size_mb: float,
+    min_interval: float = 3.0,
+):
+    """
+    Build a ``progress_cb(pass_num, pct)`` for ``compress_to_size`` that
+    edits *message* with a live compression percentage.
+
+    Two-pass encoding has two phases (analysis, then final encode) — the
+    label reflects which one is currently running so the percentage
+    resetting from ~100% back to 0% between passes doesn't look like a
+    glitch.
+
+    *message* must be a plain ``discord.Message`` for the same reason as in
+    ``_make_download_progress_cb``: long movies can take well over 15
+    minutes to compress, longer than an interaction/webhook token stays
+    valid, so edits must go through the normal channel-message API instead.
+    """
+    state = {"last_edit": 0.0}
+
+    def _cb(pass_num: int, pct: float) -> None:
+        now = time.monotonic()
+        if now - state["last_edit"] < min_interval:
+            return
+        state["last_edit"] = now
+
+        bar_len = 20
+        filled = int(bar_len * pct / 100)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        stage = "تحليل الفيديو" if pass_num == 1 else "الترميز النهائي"
+        desc = (
+            f"🎞️ جاري ضغط **{title}** (480p) ليصبح أقل من {max_size_mb:.0f} ميغابايت...\n"
+            f"المرحلة {pass_num}/2 — {stage}\n"
+            f"`{bar}` **{pct:.0f}%**"
+        )
+        embed = discord.Embed(description=desc, color=ANIME_COLOR)
+        coro = message.edit(embed=embed)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, loop)
+        except Exception:
+            log.debug("[video] compress progress edit scheduling failed", exc_info=True)
+
+    return _cb
+
+
 async def _send_episode_as_video(
     interaction: discord.Interaction,
     stream_url: str,
@@ -128,25 +237,24 @@ async def _send_episode_as_video(
     await interaction.followup.send(
         embed=discord.Embed(
             description=(
-                "🎞️ جاري تحضير الفيديو وضغطه ليصبح أقل من "
-                f"{max_size_mb:.0f} ميغابايت... قد يستغرق هذا بضع دقائق."
+                "⬇️ جاري تحميل الفيديو... **0%**"
             ),
             color=ANIME_COLOR,
         ),
-        ephemeral=True,
     )
 
     src_path: Optional[str] = None
     out_path: Optional[str] = None
     try:
+        progress_cb = _make_download_progress_cb(loop, interaction, title)
         try:
             src_path = await asyncio.wait_for(
-                loop.run_in_executor(None, download_source, stream_url, referer),
-                timeout=180,
+                loop.run_in_executor(None, download_source, stream_url, referer, 60, progress_cb),
+                timeout=1800,
             )
         except asyncio.TimeoutError:
             await interaction.followup.send(
-                embed=_embed_error("⏰ انتهى الوقت أثناء تحميل الفيديو من المصدر."), ephemeral=True
+                embed=_embed_error("⏰ انتهى الوقت أثناء تحميل الفيديو من المصدر.")
             )
             return
         except DownloadBlockedError as exc:
@@ -156,20 +264,26 @@ async def _send_episode_as_video(
                     "💡 جرّب سيرفر/جودة أخرى، أو استخدم `/episode` بدون خيار «ارسال_فيديو» "
                     "للحصول على روابط تحميل مباشرة بدلاً من ذلك."
                 ),
-                ephemeral=True,
             )
             return
         except Exception:
             log.exception("[video] failed to download source for %s", title)
             await interaction.followup.send(
-                embed=_embed_error("❌ تعذّر تحميل الفيديو من الخادم المصدر."), ephemeral=True
+                embed=_embed_error("❌ تعذّر تحميل الفيديو من الخادم المصدر.")
             )
             return
+
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                description="✅ اكتمل التحميل، جاري التحقق من مدة الفيديو...",
+                color=ANIME_COLOR,
+            )
+        )
 
         duration = await loop.run_in_executor(None, probe_duration, src_path)
         if not duration:
             await interaction.followup.send(
-                embed=_embed_error("❌ تعذّر قراءة معلومات الفيديو لضغطه."), ephemeral=True
+                embed=_embed_error("❌ تعذّر قراءة معلومات الفيديو لضغطه.")
             )
             return
 
@@ -178,30 +292,52 @@ async def _send_episode_as_video(
             cap_minutes = MAX_COMPRESSIBLE_SECONDS // 60
             await interaction.followup.send(
                 embed=_embed_error(
-                    f"❌ هذا المحتوى طويل جداً (~{minutes} دقيقة) لإرساله كفيديو مضغوط.\n"
-                    f"إرسال الفيديو يدعم فقط حلقات حتى ~{cap_minutes} دقيقة — "
-                    "الأفلام والمحتوى الطويل ستكون جودته غير قابلة للمشاهدة عند ضغطه لهذا الحجم، "
-                    "وقد يستغرق وقتاً طويلاً جداً.\n"
+                    f"❌ هذا المحتوى طويل جداً (~{minutes} دقيقة) لإرساله كفيديو مضغوط "
+                    f"(الحد الأقصى ~{cap_minutes} دقيقة).\n"
                     "💡 استخدم `/episode` بدون خيار «ارسال_فيديو» للحصول على روابط تحميل مباشرة بدلاً من ذلك."
                 ),
-                ephemeral=True,
             )
             return
 
+        long_content_note = (
+            "\n⚠️ المحتوى طويل نسبياً، فجودة الفيديو المضغوط (480p) هتكون أقل من المعتاد "
+            "وقد يستغرق الضغط وقتاً أطول."
+            if duration > 30 * 60
+            else ""
+        )
+        await interaction.edit_original_response(
+            embed=discord.Embed(
+                description=(
+                    "🎞️ تم التحميل بنجاح، جاري ضغط الفيديو (480p) ليصبح أقل من "
+                    f"{max_size_mb:.0f} ميغابايت... قد يستغرق هذا بضع دقائق."
+                    f"{long_content_note}"
+                ),
+                color=ANIME_COLOR,
+            )
+        )
+
+        # Two-pass encoding time scales with source duration, not just file
+        # size — a two-hour movie needs meaningfully longer than a 20-minute
+        # episode even at "veryfast" preset, so give long content more room
+        # instead of a single fixed timeout tuned for TV-episode lengths.
+        compress_timeout = max(900, int(duration * 1.5))
+        compress_progress_cb = _make_compress_progress_cb(loop, interaction, title, max_size_mb)
         try:
             out_path = await asyncio.wait_for(
-                loop.run_in_executor(None, compress_to_size, src_path, duration, max_size_mb),
-                timeout=600,
+                loop.run_in_executor(
+                    None, compress_to_size, src_path, duration, max_size_mb, 64, compress_timeout, compress_progress_cb
+                ),
+                timeout=compress_timeout,
             )
         except asyncio.TimeoutError:
             await interaction.followup.send(
-                embed=_embed_error("⏰ انتهى الوقت أثناء ضغط الفيديو."), ephemeral=True
+                embed=_embed_error("⏰ انتهى الوقت أثناء ضغط الفيديو.")
             )
             return
 
         if not out_path:
             await interaction.followup.send(
-                embed=_embed_error("❌ تعذّر ضغط الفيديو إلى الحجم المطلوب."), ephemeral=True
+                embed=_embed_error("❌ تعذّر ضغط الفيديو إلى الحجم المطلوب.")
             )
             return
 
@@ -212,7 +348,6 @@ async def _send_episode_as_video(
                     f"⚠️ الحلقة طويلة جداً ولم يمكن ضغطها إلى أقل من {max_size_mb:.0f} ميغابايت "
                     f"(الحجم النهائي {size_mb:.1f} ميغابايت)."
                 ),
-                ephemeral=True,
             )
             return
 
@@ -220,7 +355,6 @@ async def _send_episode_as_video(
         await interaction.followup.send(
             content=f"🎬 **{title}** — ({size_mb:.1f}MB)",
             file=discord.File(out_path, filename=f"{safe_name}.mp4"),
-            ephemeral=True,
         )
     finally:
         cleanup_video(src_path, out_path)
@@ -277,6 +411,7 @@ class MangaBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
+        cleanup_stale_temp_video_files()
         await db.init_db()
         await db.export_to_json()
         _register_commands(self.tree, self)
@@ -1701,7 +1836,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         loop = asyncio.get_running_loop()
 
         # ── Anime Slayer path ────────────────────────────────────────────────
@@ -1716,7 +1851,6 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                         "❌ تعذّر استخراج روابط التحميل من Anime Slayer.\n"
                         "💡 جرّب فتح الرابط مباشرةً من المتصفح."
                     ),
-                    ephemeral=True,
                 )
                 return
 
@@ -1733,7 +1867,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                 )
                 if not chosen_url:
                     await interaction.followup.send(
-                        embed=_embed_error("❌ لم يتم العثور على رابط فيديو صالح."), ephemeral=True
+                        embed=_embed_error("❌ لم يتم العثور على رابط فيديو صالح.")
                     )
                     return
                 await _send_episode_as_video(
@@ -1762,7 +1896,7 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                     )
 
             embed.set_footer(text="الروابط مؤقتة — حمّل فوراً", icon_url=_FOOTER_ICON)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed)
             return
 
         # ── anime3rb path (yt-dlp) ───────────────────────────────────────────
@@ -1821,12 +1955,12 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
             )
         except asyncio.TimeoutError:
             await interaction.followup.send(
-                embed=_embed_error("⏰ انتهى الوقت — الموقع بطيء أو محجوب."), ephemeral=True
+                embed=_embed_error("⏰ انتهى الوقت — الموقع بطيء أو محجوب.")
             )
             return
         except Exception as exc:
             await interaction.followup.send(
-                embed=_embed_error(f"❌ تعذّر استخراج الرابط:\n```{str(exc)[:300]}```"), ephemeral=True
+                embed=_embed_error(f"❌ تعذّر استخراج الرابط:\n```{str(exc)[:300]}```")
             )
             return
 
@@ -1857,7 +1991,6 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
                         "💡 تأكد أن الرابط هو صفحة **حلقة** وليس صفحة **الأنمي** كاملاً.\n"
                         "مثال صحيح: `https://anime3rb.com/episodes/chainsaw-man-1`"
                     ),
-                    ephemeral=True,
                 )
                 return
             video_formats = [{"url": direct, "height": 0, "ext": "mp4"}]
@@ -1907,12 +2040,12 @@ def _register_commands(tree: app_commands.CommandTree, bot: MangaBot) -> None:
 
         if shown == 0:
             await interaction.followup.send(
-                embed=_embed_error("❌ لم يُعثر على جودات قابلة للتشغيل."), ephemeral=True
+                embed=_embed_error("❌ لم يُعثر على جودات قابلة للتشغيل.")
             )
             return
 
         embed.set_footer(text="The sky  •  الروابط مؤقتة وتنتهي بعد فترة", icon_url=_FOOTER_ICON)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

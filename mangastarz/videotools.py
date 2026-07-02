@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 from typing import Callable, Optional
@@ -39,6 +41,10 @@ import requests
 log = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, Optional[int]], None]
+
+# Called as compress_progress_cb(pass_num, pct) — pass_num is 1 (analysis) or
+# 2 (final encode), pct is 0-100 based on encoded time vs. source duration.
+CompressProgressCallback = Callable[[int, float], None]
 
 _DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -92,12 +98,16 @@ def _resolve_mediafire_url(url: str, timeout: int = 20) -> str:
         return url
 
 # Above this duration, squeezing the video under the size cap yields such a
-# low bitrate (and can take so long to download/encode) that it isn't worth
-# attempting — callers should reject these up front.
-MAX_COMPRESSIBLE_SECONDS = 30 * 60  # 30 minutes — covers normal TV episodes
+# low bitrate that even a fixed 480p encode gets very rough — callers should
+# warn the user up front, but content up to a full-length movie is still
+# allowed through (locked to 480p, see _pick_scale) rather than rejected.
+MAX_COMPRESSIBLE_SECONDS = 3 * 60 * 60  # 3 hours — covers movies too
 
 # Safety cap so a runaway/huge source file can't fill up disk.
-MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
+# Raised from 2GB to 4GB so full movies/high-bitrate episodes over 1GB are
+# accepted instead of being rejected early — the actual bottleneck for large
+# files is giving the download step enough time (see bot.py), not this cap.
+MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 4GB
 
 _CHUNK = 1024 * 256
 
@@ -109,6 +119,52 @@ _VIDEO_CONTENT_TYPES = ("video/", "application/octet-stream", "application/mp4",
 class DownloadBlockedError(Exception):
     """Raised when the source host returns something other than video data
     (e.g. an anti-bot interstitial / "repair" page instead of the file)."""
+
+
+def cleanup_stale_temp_files() -> None:
+    """
+    Remove leftover temp files from a previous, uncleanly-terminated process
+    (e.g. the bot was killed/restarted mid-download or mid-compression).
+
+    ``download_source``/``compress_to_size`` clean up after themselves in a
+    ``finally`` block on the happy/error path, but that block never runs if
+    the process is killed outright — a multi-GB ``*_source`` file or large
+    ffmpeg two-pass log can then sit in /tmp indefinitely and eventually trip
+    the disk quota for an unrelated later download (observed directly: two
+    orphaned 2.1GB ``*_source`` files plus stale ``ffmpeg2pass_*`` logs were
+    enough to cause "Disk quota exceeded" on the next real download).
+
+    Safe to call on every startup: any file matching these patterns is, by
+    definition, from a previous process (a running instance couldn't have
+    been sharing tmp files across process restarts).
+    """
+    tmp_dir = tempfile.gettempdir()
+    patterns = (
+        re.compile(r"^tmp.*_source$"),
+        re.compile(r"^tmp.*_episode\.mp4$"),
+        re.compile(r"^ffmpeg2pass_"),
+    )
+    removed = 0
+    freed_bytes = 0
+    try:
+        for name in os.listdir(tmp_dir):
+            if not any(p.match(name) for p in patterns):
+                continue
+            full_path = os.path.join(tmp_dir, name)
+            try:
+                if os.path.isfile(full_path):
+                    freed_bytes += os.path.getsize(full_path)
+                    os.remove(full_path)
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if removed:
+        log.info(
+            "[videotools] startup cleanup removed %d stale temp file(s), freed %.1fMB",
+            removed, freed_bytes / 1024 / 1024,
+        )
 
 
 def download_source(
@@ -237,14 +293,74 @@ def probe_duration(path: str, timeout: int = 25) -> Optional[float]:
 
 
 def _pick_scale(video_kbps: int) -> Optional[str]:
-    """Downscale low-bitrate encodes so the smaller frame keeps relatively more detail."""
-    if video_kbps < 100:
-        return "scale=-2:240"
-    if video_kbps < 250:
-        return "scale=-2:360"
-    if video_kbps < 500:
-        return "scale=-2:480"
-    return None
+    """
+    Always downscale to 480p for compressed output.
+
+    A fixed 480p target keeps quality/behavior predictable for viewers
+    regardless of source resolution or how little bitrate the size budget
+    leaves for very long content (movies) — ffmpeg's ``scale`` filter is a
+    no-op if the source is already <= 480p tall.
+    """
+    return "scale=-2:480"
+
+
+def _run_ffmpeg_with_progress(
+    cmd: list,
+    duration: float,
+    pass_num: int,
+    progress_cb: Optional[CompressProgressCallback],
+    timeout: int,
+) -> None:
+    """
+    Run an ffmpeg command that includes ``-progress pipe:1``, reporting
+    encode position back through *progress_cb* as it goes.
+
+    A background thread drains stdout into a queue so the main loop can
+    enforce *timeout* even if ffmpeg stalls without producing any more
+    progress lines (a plain ``for line in proc.stdout`` would block forever
+    in that case). Raises ``subprocess.CalledProcessError`` on non-zero exit
+    or ``subprocess.TimeoutExpired`` if no progress arrives within timeout.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    line_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    line_queue.put(line)
+        finally:
+            line_queue.put(None)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    start = time.monotonic()
+    while True:
+        remaining = timeout - (time.monotonic() - start)
+        if remaining <= 0:
+            proc.kill()
+            proc.wait()
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        try:
+            line = line_queue.get(timeout=min(remaining, 5.0))
+        except queue.Empty:
+            continue
+        if line is None:
+            break
+        line = line.strip()
+        if line.startswith("out_time_ms=") and progress_cb and duration:
+            try:
+                microseconds = int(line.split("=", 1)[1])
+                pct = min((microseconds / 1_000_000) / duration * 100, 100)
+                progress_cb(pass_num, pct)
+            except ValueError:
+                pass
+
+    stderr_text = proc.stderr.read() if proc.stderr else ""
+    returncode = proc.wait(timeout=max(1, timeout - (time.monotonic() - start)))
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, cmd, output=None, stderr=stderr_text.encode())
 
 
 def compress_to_size(
@@ -253,6 +369,7 @@ def compress_to_size(
     max_size_mb: float = 10.0,
     audio_kbps: int = 64,
     timeout: int = 900,
+    progress_cb: Optional[CompressProgressCallback] = None,
 ) -> Optional[str]:
     """
     Re-encode the local file at *src_path* so the output fits within
@@ -292,12 +409,13 @@ def compress_to_size(
         if scale:
             base_cmd += ["-vf", scale]
 
+        progress_flags = ["-progress", "pipe:1", "-nostats"]
         pass1_cmd = (
-            ["ffmpeg", "-y"] + base_cmd
+            ["ffmpeg", "-y"] + base_cmd + progress_flags
             + ["-an", "-pass", "1", "-passlogfile", passlog_prefix, "-f", "mp4", os.devnull]
         )
         pass2_cmd = (
-            ["ffmpeg", "-y"] + base_cmd
+            ["ffmpeg", "-y"] + base_cmd + progress_flags
             + [
                 "-pass", "2", "-passlogfile", passlog_prefix,
                 "-c:a", "aac", "-b:a", f"{audio_kbps}k",
@@ -307,8 +425,8 @@ def compress_to_size(
         )
 
         try:
-            subprocess.run(pass1_cmd, capture_output=True, timeout=timeout, check=True)
-            subprocess.run(pass2_cmd, capture_output=True, timeout=timeout, check=True)
+            _run_ffmpeg_with_progress(pass1_cmd, duration, 1, progress_cb, timeout)
+            _run_ffmpeg_with_progress(pass2_cmd, duration, 2, progress_cb, timeout)
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or b"").decode(errors="ignore")[-500:]
             log.warning("[videotools] ffmpeg two-pass compression failed: %s", stderr)
